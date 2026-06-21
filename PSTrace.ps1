@@ -7,12 +7,108 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 # Load WPF and Drawing Assemblies
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, Microsoft.VisualBasic, System.Drawing
 
-# Define a C# class to support DataGrid inline adding (CanUserAddRows)
-if (-not ("KeywordItem" -as [type])) {
+# Define C# classes for extreme performance, low memory overhead, bulk UI updates, and native parsing
+if (-not ("LogParser" -as [type])) {
     Add-Type @"
+    using System;
+    using System.Collections.Generic;
+    using System.Collections.ObjectModel;
+    using System.Collections.Specialized;
+
     public class KeywordItem {
         public string Key { get; set; }
         public string Value { get; set; }
+    }
+    public class LogEntry {
+        public string Message { get; set; }
+        public string RawMsg { get; set; }
+        public string Level { get; set; }
+        public string TypeVal { get; set; }
+    }
+    public class ObservableRangeCollection<T> : ObservableCollection<T> {
+        public void AddRange(IEnumerable<T> collection) {
+            foreach (var i in collection) { Items.Add(i); }
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        }
+    }
+    public static class LogParser {
+        public static LogEntry ParseLine(string line, System.Collections.Hashtable keywords) {
+            if (line.StartsWith("<![LOG[", StringComparison.Ordinal) && line.Contains("]LOG]!>")) {
+                int msgStart = 7; // "<![LOG[".Length
+                int msgEnd = line.IndexOf("]LOG]!>", msgStart, StringComparison.Ordinal);
+                if (msgEnd < 0) return null; // Malformed
+                
+                string rawMsg = line.Substring(msgStart, msgEnd - msgStart);
+                
+                // Find type
+                int typeStart = line.IndexOf("type=\"", msgEnd, StringComparison.Ordinal);
+                if (typeStart < 0) return null;
+                typeStart += 6; // "type=\"".Length
+                int typeEnd = line.IndexOf("\"", typeStart, StringComparison.Ordinal);
+                if (typeEnd < 0) return null;
+                string typeVal = line.Substring(typeStart, typeEnd - typeStart);
+                
+                // Find time
+                int timeStart = line.IndexOf("time=\"", msgEnd, StringComparison.Ordinal);
+                if (timeStart < 0) return null;
+                timeStart += 6;
+                int timeEnd = line.IndexOf("\"", timeStart, StringComparison.Ordinal);
+                if (timeEnd < 0) return null;
+                string timeStr = line.Substring(timeStart, timeEnd - timeStart);
+                
+                // Find date
+                int dateStart = line.IndexOf("date=\"", msgEnd, StringComparison.Ordinal);
+                if (dateStart < 0) return null;
+                dateStart += 6;
+                int dateEnd = line.IndexOf("\"", dateStart, StringComparison.Ordinal);
+                if (dateEnd < 0) return null;
+                string dateStr = line.Substring(dateStart, dateEnd - dateStart);
+
+                string combinedStr = dateStr + " " + timeStr;
+                DateTime dt = DateTime.Now;
+                int tzIndex = combinedStr.IndexOfAny(new char[] { '+', '-' });
+                if (tzIndex > 0) {
+                    combinedStr = combinedStr.Substring(0, tzIndex);
+                }
+                if (!DateTime.TryParse(combinedStr, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out dt)) {
+                    dt = DateTime.Now;
+                }
+
+                string level = "Info";
+                foreach (System.Collections.DictionaryEntry kw in keywords) {
+                    if (rawMsg.IndexOf((string)kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        level = (string)kw.Key;
+                        break;
+                    }
+                }
+                if (level == "Info") {
+                    if (typeVal == "1") level = "Error";
+                    else if (typeVal == "2") level = "Warning";
+                    else if (typeVal == "4") level = "Verbose";
+                }
+
+                return new LogEntry {
+                    Message = "[" + dt.ToString("HH:mm:ss.fff") + "] " + rawMsg,
+                    RawMsg = rawMsg,
+                    Level = level,
+                    TypeVal = typeVal
+                };
+            } else {
+                string level = "Info";
+                foreach (System.Collections.DictionaryEntry kw in keywords) {
+                    if (line.IndexOf((string)kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        level = (string)kw.Key;
+                        break;
+                    }
+                }
+                return new LogEntry {
+                    Message = line,
+                    RawMsg = line,
+                    Level = level,
+                    TypeVal = "0"
+                };
+            }
+        }
     }
 "@
 }
@@ -46,7 +142,6 @@ function Add-SlowScroll {
 # --- Configuration & INI Management ---
  $script:ConfigPath = "$env:APPDATA\PS_CMTraceViewer.ini"
 
-# Friendly color names mapped to pastel hex codes for UI backgrounds
  $script:ColorMap = @{
     "Red"    = "#FFFFCDD2"
     "Orange" = "#FFFFE0B2"
@@ -57,11 +152,9 @@ function Add-SlowScroll {
     "White"  = "#FFFFFFFF"
 }
 
-# Reverse map to clean up old INI files
  $script:ReverseColorMap = @{}
 foreach($k in $script:ColorMap.Keys) { $script:ReverseColorMap[$script:ColorMap[$k]] = $k }
 
-# Expanded default keywords
  $script:Config = @{
     FontFamily         = "Consolas"
     FontSize           = 12
@@ -114,9 +207,7 @@ function Load-Config {
         }
         
         foreach($line in Get-Content $script:ConfigPath) {
-            if ($line -match '^\[(.+)\]$') { 
-                $section = $matches[1] 
-            }
+            if ($line -match '^\[(.+)\]$') { $section = $matches[1] } 
             elseif ($line -match '^(.+)=(.*)$') {
                 $key = $matches[1]; $val = $matches[2]
                 if ($section -eq "Settings") { $settings[$key] = $val }
@@ -124,9 +215,7 @@ function Load-Config {
                     if ($script:ReverseColorMap.ContainsKey($val)) { $val = $script:ReverseColorMap[$val] }
                     $kw[$key] = $val
                 }
-                elseif ($section -eq "Delimiters") {
-                    $delims += $val
-                }
+                elseif ($section -eq "Delimiters") { $delims += $val }
             }
         }
         $script:Config.FontFamily = $settings["FontFamily"]
@@ -162,33 +251,108 @@ function Save-Config {
         $lines += "WindowHeight=$($script:Config.WindowHeight)"
         $lines += ""
         $lines += "[Keywords]"
-        foreach($kv in $script:Config.Keywords.GetEnumerator()) {
-            $lines += "$($kv.Key)=$($kv.Value)"
-        }
+        foreach($kv in $script:Config.Keywords.GetEnumerator()) { $lines += "$($kv.Key)=$($kv.Value)" }
         $lines += ""
         $lines += "[Delimiters]"
         $i = 1
-        foreach($d in $script:Config.CustomDelimiters) {
-            $lines += "$i=$d"
-            $i++
-        }
+        foreach($d in $script:Config.CustomDelimiters) { $lines += "$i=$d"; $i++ }
         $lines | Out-File $script:ConfigPath -Encoding UTF8 -Force
     } catch {
         [System.Windows.MessageBox]::Show("Failed to save settings: $_", "Error", "OK", "Error")
     }
 }
 
-# Load config on startup
 Load-Config
 
-# Pre-compile Regex for extreme performance
- $script:LogRegex = [regex]::new(
-    '<!\[LOG\[(?<Message>.*?)\]LOG\]!><time="(?<Time>.*?)"\s+date="(?<Date>.*?)"\s+component="(?<Component>.*?)"\s+context=".*?"\s+type="(?<Type>.*?)"\s+thread="(?<Thread>.*?)"\s+file=".*?">', 
-    [System.Text.RegularExpressions.RegexOptions]::Compiled
-)
-
-# Global buffer for partial writes
- $script:PendingBuffer = ""
+# --- Multithreading Architecture: Background Runspace Script Block ---
+ $bgScript = {
+    param($FilePath, $Keywords, $LogQueue, $CancellationToken, $SharedState)
+    
+    $stream = $null
+    $reader = $null
+    $lastFileLength = $SharedState.LastFileLength
+    $pendingBuffer = $SharedState.PendingBuffer
+    $buffer = New-Object System.Text.StringBuilder # Instantiated once outside the loop for zero GC pressure
+    
+    try {
+        while (-not $CancellationToken.IsCancellationRequested) {
+            try {
+                if (-not (Test-Path $FilePath)) { Start-Sleep -Seconds 2; continue }
+                
+                $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
+                if ($null -eq $fileInfo) { Start-Sleep -Seconds 2; continue }
+                
+                $currentLength = $fileInfo.Length
+                
+                if ($currentLength -lt $lastFileLength) {
+                    $lastFileLength = 0
+                    $pendingBuffer = ""
+                }
+                
+                if ($currentLength -gt $lastFileLength) {
+                    if ($null -eq $stream -or $stream.SafeFileHandle.IsClosed -or $stream.SafeFileHandle.IsInvalid) {
+                        if ($stream -ne $null) { $stream.Dispose() }
+                        if ($reader -ne $null) { $reader.Dispose() }
+                        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+                        $reader = New-Object System.IO.StreamReader($stream, $true)
+                    }
+                    
+                    $reader.BaseStream.Seek($lastFileLength, [System.IO.SeekOrigin]::Begin) | Out-Null
+                    $lastFileLength = $currentLength
+                    
+                    [void]$buffer.Clear()
+                    if ($pendingBuffer.Length -gt 0) {
+                        [void]$buffer.Append($pendingBuffer)
+                        $pendingBuffer = ""
+                    }
+                    
+                    while (($line = $reader.ReadLine()) -ne $null) {
+                        if ($line.StartsWith('<![LOG[') -and $buffer.Length -gt 0) { 
+                            $entry = [LogParser]::ParseLine($buffer.ToString(), $Keywords)
+                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
+                            [void]$buffer.Clear().Append($line)
+                        }
+                        elseif ($line.StartsWith('<![LOG[')) { 
+                            [void]$buffer.Clear().Append($line)
+                        }
+                        elseif ($buffer.Length -gt 0) { 
+                            [void]$buffer.AppendLine($line)
+                        }
+                        else { 
+                            $entry = [LogParser]::ParseLine($line, $Keywords)
+                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
+                        }
+                    }
+                    
+                    if ($buffer.Length -gt 0) {
+                        $bufferStr = $buffer.ToString()
+                        if ($bufferStr.StartsWith('<![LOG[') -and -not $bufferStr.Contains("]LOG]!>")) {
+                            $pendingBuffer = $bufferStr
+                        } else {
+                            $entry = [LogParser]::ParseLine($bufferStr, $Keywords)
+                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
+                        }
+                    }
+                }
+            } catch [System.IO.IOException] {
+                # File locked or temporarily unavailable
+                Start-Sleep -Milliseconds 500
+                continue
+            } catch {
+                # Catch all to prevent runspace crash
+                Start-Sleep -Milliseconds 500
+                continue
+            }
+            Start-Sleep -Milliseconds 500 # Tail loop delay
+        }
+    }
+    finally {
+        if ($reader -ne $null) { $reader.Dispose() }
+        if ($stream -ne $null) { $stream.Dispose() }
+        $SharedState.LastFileLength = $lastFileLength
+        $SharedState.PendingBuffer = $pendingBuffer
+    }
+}
 
 # --- Main XAML UI ---
 [xml]$xaml = @"
@@ -218,9 +382,9 @@ Load-Config
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="*" MinHeight="100"/>
             <RowDefinition Height="5"/>
-            <RowDefinition Height="$($script:Config.BottomPanelHeight)" x:Name="BottomRow"/>
+            <RowDefinition Height="$($script:Config.BottomPanelHeight)" MinHeight="100" x:Name="BottomRow"/>
         </Grid.RowDefinitions>
         
         <Menu Grid.Row="0" Background="#FFF0F0F0">
@@ -262,8 +426,9 @@ Load-Config
                   BorderThickness="1,0,1,1" BorderBrush="#FFD0D0D0"
                   ScrollViewer.HorizontalScrollBarVisibility="Auto"
                   ScrollViewer.VerticalScrollBarVisibility="Auto"
-                  VirtualizingPanel.ScrollUnit="Pixel">
-            
+                  VirtualizingPanel.ScrollUnit="Pixel"
+                  VirtualizingPanel.IsVirtualizing="True" 
+                  VirtualizingPanel.VirtualizationMode="Recycling">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Log Entry" Binding="{Binding Message}" Width="*">
                     <DataGridTextColumn.ElementStyle>
@@ -289,11 +454,9 @@ Load-Config
 </Window>
 "@
 
-# Read XAML and create the window
  $reader = (New-Object System.Xml.XmlNodeReader $xaml)
  $Window = [Windows.Markup.XamlReader]::Load($reader)
 
-# Connect UI Elements
  $OpenMenu = $Window.FindName("OpenMenu")
  $ExitMenu = $Window.FindName("ExitMenu")
  $FindMenu = $Window.FindName("FindMenu")
@@ -307,14 +470,63 @@ Load-Config
  $SearchBtn = $Window.FindName("SearchBtn")
  $ClearSearchBtn = $Window.FindName("ClearSearchBtn")
 
-# Apply Slow Scroll to Main UI elements
 Add-SlowScroll $LogDataGrid
 Add-SlowScroll $DetailTextBox
 
-# Global variables
+# Global Thread-Safe Variables
  $script:CurrentLogFile = $null
- $script:LastFileLength = 0
  $script:RefreshTimer = $null
+ $script:Cts = $null
+ $script:RunspacePS = $null
+ $script:AsyncResult = $null
+ $script:LogQueue = $null
+ $script:SharedState = $null
+
+# --- Runspace Management ---
+function Stop-LogTailing {
+    if ($script:Cts -ne $null) { $script:Cts.Cancel() }
+    if ($script:RunspacePS -ne $null) {
+        try { 
+            if ($script:AsyncResult -ne $null -and -not $script:AsyncResult.IsCompleted) {
+                $script:AsyncResult.AsyncWaitHandle.WaitOne(2000) | Out-Null
+            }
+            $script:RunspacePS.EndInvoke($script:AsyncResult)
+        } catch {}
+        try { $script:RunspacePS.Stop() } catch {}
+        try { $script:RunspacePS.Dispose() } catch {}
+        $script:RunspacePS = $null
+        $script:AsyncResult = $null
+    }
+    if ($script:Cts -ne $null) {
+        $script:Cts.Dispose()
+        $script:Cts = $null
+    }
+}
+
+function Start-LogTailing {
+    param([string]$FilePath, [bool]$ResetState = $false)
+
+    Stop-LogTailing
+
+    if ($ResetState -or $script:SharedState -eq $null) {
+        $script:SharedState = @{ LastFileLength = 0; PendingBuffer = "" }
+    }
+    if ($script:LogQueue -eq $null) {
+        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[LogEntry]]::new()
+    }
+
+    $script:Cts = New-Object System.Threading.CancellationTokenSource
+
+    $script:RunspacePS = [System.Management.Automation.PowerShell]::Create()
+    $script:RunspacePS.AddScript($bgScript).
+        AddArgument($FilePath).
+        AddArgument($script:Config.Keywords).
+        AddArgument($script:LogQueue).
+        AddArgument($script:Cts.Token).
+        AddArgument($script:SharedState) | Out-Null
+
+    $script:AsyncResult = $script:RunspacePS.BeginInvoke()
+}
 
 # --- Dynamic Styling Logic ---
 function Apply-ConfigToGui {
@@ -325,9 +537,7 @@ function Apply-ConfigToGui {
         $LogDataGrid.FontSize = $script:Config.FontSize
         $DetailTextBox.FontSize = $script:Config.FontSize
 
-        if ($BottomRow -ne $null) {
-            $BottomRow.Height = New-Object System.Windows.GridLength([double]$script:Config.BottomPanelHeight)
-        }
+        if ($BottomRow -ne $null) { $BottomRow.Height = New-Object System.Windows.GridLength([double]$script:Config.BottomPanelHeight) }
 
         $styleXml = "<Style TargetType='DataGridRow' xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>"
         $styleXml += "<Setter Property='Background' Value='White'/>"
@@ -342,12 +552,9 @@ function Apply-ConfigToGui {
         }
         
         $styleXml += "<Trigger Property='IsSelected' Value='True'><Setter Property='Background' Value='Blue'/><Setter Property='Foreground' Value='White'/></Trigger>"
+        $styleXml += "</Style.Triggers></Style>"
         
-        $styleXml += "</Style.Triggers>"
-        $styleXml += "</Style>"
-        
-        $style = [Windows.Markup.XamlReader]::Parse($styleXml)
-        $LogDataGrid.ItemContainerStyle = $style
+        $LogDataGrid.ItemContainerStyle = [Windows.Markup.XamlReader]::Parse($styleXml)
     } catch {
         [System.Windows.MessageBox]::Show("Failed to apply UI styles: $_", "UI Error", "OK", "Warning")
     }
@@ -355,167 +562,37 @@ function Apply-ConfigToGui {
 
 Apply-ConfigToGui
 
-# --- Log Parsing Logic ---
-function Get-LogLevel {
-    param([string]$Message, [string]$TypeVal)
-    $msgLower = $Message.ToLower()
-    foreach ($kw in $script:Config.Keywords.Keys) {
-        if ($msgLower -match [regex]::Escape($kw.ToLower())) { return $kw }
-    }
-    if ($TypeVal -eq "1") { return "Error" }
-    if ($TypeVal -eq "2") { return "Warning" }
-    if ($TypeVal -eq "4") { return "Verbose" }
-    return "Info"
-}
-
+# --- UI Parsing Logic (Used only for Settings re-evaluation and formatting) ---
 function Format-LogDetails {
     param([string]$RawMsg)
     $msg = $RawMsg
-
     if ($script:Config.FormatJson) {
         $trimMsg = $msg.TrimStart()
         if ($trimMsg.StartsWith("{") -or $trimMsg.StartsWith("[")) {
-            try {
-                $jsonObj = $msg | ConvertFrom-Json -ErrorAction Stop
-                $msg = $jsonObj | ConvertTo-Json -Depth 10
-            } catch { }
+            try { $msg = ($msg | ConvertFrom-Json -ErrorAction Stop | ConvertTo-Json -Depth 10) } catch { }
         }
     }
-
     if ($script:Config.SplitComma) { $msg = $msg -replace ',', ",`r`n" }
     if ($script:Config.SplitSpace) { $msg = $msg -replace ' ', " `r`n" }
     if ($script:Config.SplitPeriod) { $msg = $msg -replace '\.', ".`r`n" }
-
     if ($script:Config.CustomDelimiters.Count -gt 0) {
         foreach ($d in $script:Config.CustomDelimiters) {
-            if (-not [string]::IsNullOrWhiteSpace($d)) {
-                $msg = $msg -replace [regex]::Escape($d), "$d`r`n"
-            }
+            if (-not [string]::IsNullOrWhiteSpace($d)) { $msg = $msg -replace [regex]::Escape($d), "$d`r`n" }
         }
     }
     return $msg
 }
 
-function Parse-CMTraceLine {
-    param([string]$Line)
-    $match = $script:LogRegex.Match($Line)
-    
-    if ($match.Success) {
-        $timeStr = $match.Groups['Time'].Value
-        $dateStr = $match.Groups['Date'].Value
-        $combinedStr = "$dateStr $timeStr"
-        $dt = [datetime]::Now
-        $parsedDate = $null
-        
-        if ([datetime]::TryParse($combinedStr, [ref]$parsedDate)) {
-            $dt = $parsedDate
-        } else {
-            $cleanTime = $timeStr -replace '\+\d+$', '' -replace '-\d+$', ''
-            $combinedStr = "$dateStr $cleanTime"
-            if ([datetime]::TryParse($combinedStr, [ref]$parsedDate)) {
-                $dt = $parsedDate
-            }
-        }
-
-        $typeVal = $match.Groups['Type'].Value
-        $rawMsg = $match.Groups['Message'].Value
-        $level = Get-LogLevel -Message $rawMsg -TypeVal $typeVal
-
-        return [PSCustomObject]@{
-            Message   = "[$($dt.ToString('HH:mm:ss.fff'))] $rawMsg"
-            RawMsg    = $rawMsg
-            Level     = $level
-            TypeVal   = $typeVal
-        }
-    } else {
-        $level = Get-LogLevel -Message $Line -TypeVal "0"
-        
-        return [PSCustomObject]@{
-            Message   = $Line
-            RawMsg    = $Line
-            Level     = $level
-            TypeVal   = "0"
-        }
-    }
-}
-
-function Update-LogData {
-    if (-not $script:CurrentLogFile -or -not (Test-Path $script:CurrentLogFile)) { return }
-    
-    $stream = $null
-    $reader = $null
-    
-    try {
-        $fileInfo = Get-Item $script:CurrentLogFile -ErrorAction Stop
-        $currentLength = $fileInfo.Length
-        if ($currentLength -eq $script:LastFileLength) { return }
-        if ($currentLength -lt $script:LastFileLength) { 
-            $script:LastFileLength = 0 
-            $script:PendingBuffer = ""
-        }
-
-        $stream = [System.IO.File]::Open($script:CurrentLogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $reader = New-Object System.IO.StreamReader($stream)
-        
-        if ($script:LastFileLength -gt 0) { 
-            $reader.BaseStream.Seek($script:LastFileLength, [System.IO.SeekOrigin]::Begin) | Out-Null 
-        }
-        
-        $newContent = $reader.ReadToEnd()
-        $script:LastFileLength = $currentLength
-
-        $allText = $script:PendingBuffer + $newContent
-        $script:PendingBuffer = ""
-        
-        $lines = $allText -split "`r`n"
-        
-        if ($lines.Count -gt 0) {
-            $lastLine = $lines[-1]
-            if ($lastLine -match '^<!\[LOG\[' -and -not ($script:LogRegex.IsMatch($lastLine))) {
-                $script:PendingBuffer = $lastLine
-                $lines = $lines[0..($lines.Count - 2)]
-            }
-        }
-        
-        $lines = $lines | Where-Object { $_.Trim() -ne "" }
-        $newEntries = @()
-        $buffer = ""
-        
-        foreach ($line in $lines) {
-            if ($line -match '^<!\[LOG\[' -and $buffer -ne "") { $newEntries += (Parse-CMTraceLine -Line $buffer); $buffer = $line }
-            elseif ($line -match '^<!\[LOG\[') { $buffer = $line }
-            elseif ($buffer -ne "") { $buffer += "`r`n$line" }
-            else { $newEntries += (Parse-CMTraceLine -Line $line) }
-        }
-        if ($buffer -ne "") { $newEntries += (Parse-CMTraceLine -Line $buffer) }
-
-        if ($newEntries.Count -gt 0) {
-            $ObservableCollection = $LogDataGrid.ItemsSource
-            if (-not ($ObservableCollection -is [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]])) {
-                $ObservableCollection = [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]]::new()
-            }
-            
-            foreach ($entry in $newEntries) { $ObservableCollection.Add($entry) }
-            $LogDataGrid.ItemsSource = $ObservableCollection
-
-            if ($ScrollBtn.IsChecked) {
-                if ($LogDataGrid.Items.Count -gt 0) { 
-                    $LogDataGrid.ScrollIntoView($LogDataGrid.Items[$LogDataGrid.Items.Count - 1]) 
-                }
-            }
-        }
-    } catch {
-        # Silently fail to prevent timer crashes
-    } finally {
-        if ($reader -ne $null) { $reader.Dispose() }
-        if ($stream -ne $null) { $stream.Dispose() }
-    }
-}
-
 # --- Event Handlers ---
 
  $PauseBtn.Add_Click({
-    if ($PauseBtn.IsChecked) { $PauseBtn.Content = "Resume Auto-Refresh" } else { $PauseBtn.Content = "Pause Auto-Refresh" }
+    if ($PauseBtn.IsChecked) { 
+        $PauseBtn.Content = "Resume Auto-Refresh"
+        Stop-LogTailing
+    } else { 
+        $PauseBtn.Content = "Pause Auto-Refresh"
+        if ($script:CurrentLogFile -ne $null) { Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $false }
+    }
 })
 
  $ScrollBtn.Add_Click({
@@ -525,10 +602,7 @@ function Update-LogData {
  $LogDataGrid.Add_SelectionChanged({
     if ($LogDataGrid.SelectedItem -ne $null) {
         $item = $LogDataGrid.SelectedItem
-        $formattedDetails = Format-LogDetails -RawMsg $item.RawMsg
-        
-        # Add 2 explicit blank lines above the log for visual separation
-        $DetailTextBox.Text = "`r`n`r`n" + $formattedDetails
+        $DetailTextBox.Text = "`r`n`r`n" + (Format-LogDetails -RawMsg $item.RawMsg)
     }
 })
 
@@ -537,13 +611,12 @@ function Update-LogData {
     $openFileDialog.Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*"
     if ($openFileDialog.ShowDialog() -eq $true) {
         $script:CurrentLogFile = $openFileDialog.FileName
-        $script:LastFileLength = 0
-        $script:PendingBuffer = ""
         $script:Config.LastLogFile = $openFileDialog.FileName
         $Window.Title = "Configuration Manager Trace Log Tool - $($openFileDialog.FileName)"
         $LogDataGrid.ItemsSource = $null
         $DetailTextBox.Text = ""
-        Update-LogData
+        $script:LogQueue = $null # Clear queue
+        Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $true
     }
 })
 
@@ -552,66 +625,43 @@ function Update-LogData {
 function Perform-Search {
     $searchText = $SearchBox.Text
     if ([string]::IsNullOrWhiteSpace($searchText)) { return }
-
-    if (-not $PauseBtn.IsChecked) {
-        $PauseBtn.IsChecked = $true
-        $PauseBtn.Content = "Resume Auto-Refresh"
-    }
-    if ($ScrollBtn.IsChecked) {
-        $ScrollBtn.IsChecked = $false
-        $ScrollBtn.Content = "Auto-Scroll: OFF"
-    }
+    if (-not $PauseBtn.IsChecked) { $PauseBtn.IsChecked = $true; $PauseBtn.Content = "Resume Auto-Refresh" }
+    if ($ScrollBtn.IsChecked) { $ScrollBtn.IsChecked = $false; $ScrollBtn.Content = "Auto-Scroll: OFF" }
 
     $items = $LogDataGrid.Items
     if (-not $items -or $items.Count -eq 0) { return }
-
     $startIndex = $LogDataGrid.SelectedIndex + 1
     if ($startIndex -ge $items.Count -or $startIndex -lt 0) { $startIndex = 0 }
     
     for ($i = $startIndex; $i -lt $items.Count; $i++) {
         $item = $items[$i]
-        if ($item -ne $null -and $item.Message -like "*$searchText*") {
-            $LogDataGrid.SelectedIndex = $i
-            $LogDataGrid.ScrollIntoView($item)
-            $LogDataGrid.Focus()
-            return
+        if ($item -ne $null -and $item.Message.IndexOf($searchText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $LogDataGrid.SelectedIndex = $i; $LogDataGrid.ScrollIntoView($item); $LogDataGrid.Focus(); return
         }
     }
-    
     for ($i = 0; $i -lt $startIndex; $i++) {
         $item = $items[$i]
-        if ($item -ne $null -and $item.Message -like "*$searchText*") {
-            $LogDataGrid.SelectedIndex = $i
-            $LogDataGrid.ScrollIntoView($item)
-            $LogDataGrid.Focus()
-            return
+        if ($item -ne $null -and $item.Message.IndexOf($searchText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $LogDataGrid.SelectedIndex = $i; $LogDataGrid.ScrollIntoView($item); $LogDataGrid.Focus(); return
         }
     }
 }
 
  $SearchBtn.Add_Click({ Perform-Search })
  $SearchBox.Add_KeyDown({
-    if ($_.Key -eq 'Return' -or $_.Key -eq 'Enter') { 
-        $_.Handled = $true
-        Perform-Search 
-    }
+    if ($_.Key -eq 'Return' -or $_.Key -eq 'Enter') { $_.Handled = $true; Perform-Search }
 })
 
  $ClearSearchBtn.Add_Click({
-    $SearchBox.Text = ""
-    $LogDataGrid.SelectedIndex = -1
-    $DetailTextBox.Text = ""
-    $SearchBox.Focus()
+    $SearchBox.Text = ""; $LogDataGrid.SelectedIndex = -1; $DetailTextBox.Text = ""; $SearchBox.Focus()
 })
 
  $FindMenu.Add_Click({ $SearchBox.Focus() })
 
  $Window.Add_Closing({
     try {
-        if ($script:RefreshTimer -ne $null) {
-            $script:RefreshTimer.Stop()
-            $script:RefreshTimer = $null
-        }
+        if ($script:RefreshTimer -ne $null) { $script:RefreshTimer.Stop() }
+        Stop-LogTailing
         $script:Config.BottomPanelHeight = [int]$BottomRow.Height.Value
         $script:Config.WindowWidth = $Window.Width
         $script:Config.WindowHeight = $Window.Height
@@ -628,33 +678,20 @@ function Perform-Search {
         Title="Settings" Height="680" Width="450" FontSize="11" WindowStartupLocation="CenterOwner" Background="#FFF4F4F4" ResizeMode="CanResize">
     <Window.Resources>
         <x:Array x:Key="ColorList" Type="sys:String">
-            <sys:String>Red</sys:String>
-            <sys:String>Orange</sys:String>
-            <sys:String>Yellow</sys:String>
-            <sys:String>Green</sys:String>
-            <sys:String>Blue</sys:String>
-            <sys:String>Purple</sys:String>
-            <sys:String>White</sys:String>
+            <sys:String>Red</sys:String><sys:String>Orange</sys:String><sys:String>Yellow</sys:String>
+            <sys:String>Green</sys:String><sys:String>Blue</sys:String><sys:String>Purple</sys:String><sys:String>White</sys:String>
         </x:Array>
     </Window.Resources>
     <Grid Margin="5">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/><RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        
         <GroupBox Header=" General Settings " Grid.Row="0" Margin="0,0,0,5" Padding="3">
             <Grid Margin="2">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Text="Font Family:" Grid.Column="0" VerticalAlignment="Center" Margin="2"/>
                 <ComboBox Name="FontCombo" Grid.Column="1" Margin="2"/>
@@ -664,7 +701,6 @@ function Perform-Search {
                 <ComboBox Name="SpeedCombo" Grid.Column="5" Width="40" Margin="2"/>
             </Grid>
         </GroupBox>
-
         <GroupBox Header=" Detail Panel Formatting " Grid.Row="1" Margin="0,0,0,5" Padding="3">
             <WrapPanel Margin="2">
                 <CheckBox Name="JsonCheck" Content="Format JSON" Margin="2"/>
@@ -673,13 +709,9 @@ function Perform-Search {
                 <CheckBox Name="PeriodCheck" Content="Split Periods" Margin="2"/>
             </WrapPanel>
         </GroupBox>
-
         <GroupBox Header=" Custom Delimiters " Grid.Row="2" Margin="0,0,0,5" Padding="3">
             <Grid Margin="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="80"/>
-                </Grid.RowDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="80"/></Grid.RowDefinitions>
                 <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="2">
                     <TextBlock Text="Delimiter:" VerticalAlignment="Center" Margin="2"/>
                     <TextBox Name="NewDelim" Width="60" Margin="2"/>
@@ -689,13 +721,9 @@ function Perform-Search {
                 <ListBox Name="DelimList" Grid.Row="1" Margin="2" ScrollViewer.CanContentScroll="False"/>
             </Grid>
         </GroupBox>
-
         <GroupBox Header=" Keyword Highlighting " Grid.Row="3" Margin="0,0,0,5" Padding="3">
             <Grid Margin="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="*"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <DataGrid Name="KeywordsGrid" Grid.Row="0" AutoGenerateColumns="False" HeadersVisibility="Column" CanUserAddRows="True" CanUserDeleteRows="True" Margin="2" VirtualizingPanel.ScrollUnit="Pixel">
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="Keyword" Binding="{Binding Key}" Width="*" IsReadOnly="False"/>
@@ -711,7 +739,6 @@ function Perform-Search {
                 <Button Name="RemoveBtn" Content="Remove Selected" Grid.Row="1" Width="100" HorizontalAlignment="Left" Margin="2"/>
             </Grid>
         </GroupBox>
-
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Grid.Row="4" Margin="5,2,0,2">
             <Button Name="SaveBtn" Content="Save &amp; Apply" Width="90" Margin="0,0,5,0" IsDefault="True"/>
             <Button Name="CancelBtn" Content="Cancel" Width="70" IsCancel="True"/>
@@ -734,22 +761,18 @@ function Perform-Search {
     $AddDelimBtn = $sWindow.FindName("AddDelimBtn")
     $RemoveDelimBtn = $sWindow.FindName("RemoveDelimBtn")
     $DelimList = $sWindow.FindName("DelimList")
-    
     $KeywordsGrid = $sWindow.FindName("KeywordsGrid")
     $RemoveBtn = $sWindow.FindName("RemoveBtn")
     $SaveBtn = $sWindow.FindName("SaveBtn")
     $CancelBtn = $sWindow.FindName("CancelBtn")
 
-    # Apply Slow Scroll to Settings UI elements
     Add-SlowScroll $KeywordsGrid
     Add-SlowScroll $DelimList
     
     foreach($f in [System.Drawing.FontFamily]::Families | Select-Object -ExpandProperty Name) { $FontCombo.Items.Add($f) | Out-Null }
     $FontCombo.SelectedItem = $script:Config.FontFamily
-    
     8..24 | ForEach-Object { $SizeCombo.Items.Add($_) | Out-Null }
     $SizeCombo.SelectedItem = $script:Config.FontSize
-    
     1..10 | ForEach-Object { $SpeedCombo.Items.Add($_) | Out-Null }
     $SpeedCombo.SelectedItem = $script:Config.UpdateSpeed
     
@@ -766,23 +789,9 @@ function Perform-Search {
     }
     $KeywordsGrid.ItemsSource = $kwList
     
-    $AddDelimBtn.Add_Click({
-        if(-not [string]::IsNullOrEmpty($NewDelim.Text)) {
-            $DelimList.Items.Add($NewDelim.Text)
-            $NewDelim.Text = ""
-        }
-    })
-    $RemoveDelimBtn.Add_Click({
-        if($DelimList.SelectedItem -ne $null) { $DelimList.Items.Remove($DelimList.SelectedItem) }
-    })
-    
-    $RemoveBtn.Add_Click({
-        if($KeywordsGrid.SelectedItem -ne $null) { 
-            if ($KeywordsGrid.SelectedItem -is [KeywordItem]) {
-                $kwList.Remove($KeywordsGrid.SelectedItem) 
-            }
-        }
-    })
+    $AddDelimBtn.Add_Click({ if(-not [string]::IsNullOrEmpty($NewDelim.Text)) { $DelimList.Items.Add($NewDelim.Text); $NewDelim.Text = "" } })
+    $RemoveDelimBtn.Add_Click({ if($DelimList.SelectedItem -ne $null) { $DelimList.Items.Remove($DelimList.SelectedItem) } })
+    $RemoveBtn.Add_Click({ if($KeywordsGrid.SelectedItem -ne $null -and $KeywordsGrid.SelectedItem -is [KeywordItem]) { $kwList.Remove($KeywordsGrid.SelectedItem) } })
     
     $SaveBtn.Add_Click({
         $script:Config.FontFamily = $FontCombo.SelectedItem
@@ -793,54 +802,73 @@ function Perform-Search {
         $script:Config.SplitSpace = $SpaceCheck.IsChecked
         $script:Config.SplitPeriod = $PeriodCheck.IsChecked
         
-        $delims = @()
-        foreach($d in $DelimList.Items) { $delims += $d }
+        $delims = @(); foreach($d in $DelimList.Items) { $delims += $d }
         $script:Config.CustomDelimiters = $delims
         
         $newKw = @{}
-        foreach($item in $kwList) {
-            if ($item -ne $null -and -not [string]::IsNullOrWhiteSpace($item.Key)) {
-                $newKw[$item.Key] = $item.Value
-            }
-        }
+        foreach($item in $kwList) { if ($item -ne $null -and -not [string]::IsNullOrWhiteSpace($item.Key)) { $newKw[$item.Key] = $item.Value } }
         $script:Config.Keywords = $newKw
         
         Save-Config
         Apply-ConfigToGui
         
-        # --- DYNAMIC RE-COLORING LOGIC ---
         $items = $LogDataGrid.ItemsSource
-        if ($items -is [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]]) {
-            # Detach to prevent UI thread thrashing
+        if ($items -is [ObservableRangeCollection[LogEntry]]) {
             $LogDataGrid.ItemsSource = $null
             foreach ($item in $items) {
-                # Recalculate Level based on new Keywords
-                $item.Level = Get-LogLevel -Message $item.RawMsg -TypeVal $item.TypeVal
+                $parsed = [LogParser]::ParseLine($item.RawMsg, $script:Config.Keywords)
+                if ($parsed -ne $null) { $item.Level = $parsed.Level }
             }
-            # Reattach to force WPF to redraw all rows with new colors
             $LogDataGrid.ItemsSource = $items
+        }
+
+        # Restart background runspace to pick up new keywords, preserving file position
+        if ($script:CurrentLogFile -ne $null -and -not $PauseBtn.IsChecked) {
+            Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $false
         }
 
         try {
             $script:RefreshTimer.Stop()
-            $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds($script:Config.UpdateSpeed)
+            $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds([int]$SpeedCombo.SelectedItem)
             $script:RefreshTimer.Start()
         } catch {}
-        
         $sWindow.Close()
     })
-    
     $CancelBtn.Add_Click({ $sWindow.Close() })
     $sWindow.ShowDialog() | Out-Null
 })
 
-# Bulletproof DispatcherTimer
+# --- The Consumer: WPF DispatcherTimer ---
+# Drains the ConcurrentQueue on the UI thread without touching the disk
  $script:RefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
- $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds($script:Config.UpdateSpeed)
+ $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(200) # 200ms for ultra-snappy UI
  $script:RefreshTimer.Add_Tick({
     try {
-        if (-not $PauseBtn.IsChecked -and $script:CurrentLogFile) { 
-            Update-LogData 
+        if ($script:LogQueue -ne $null -and -not $script:LogQueue.IsEmpty) {
+            $newEntries = New-Object System.Collections.Generic.List[LogEntry]
+            $entry = $null
+            $maxItemsPerTick = 5000
+            $count = 0
+            
+            # Throttle dequeue to 5000 items per tick to prevent UI stutter on massive log dumps
+            while ($script:LogQueue.TryDequeue([ref]$entry) -and $count -lt $maxItemsPerTick) {
+                $newEntries.Add($entry)
+                $count++
+            }
+
+            if ($newEntries.Count -gt 0) {
+                $ObservableCollection = $LogDataGrid.ItemsSource
+                if (-not ($ObservableCollection -is [ObservableRangeCollection[LogEntry]])) {
+                    $ObservableCollection = New-Object ObservableRangeCollection[LogEntry]
+                    $LogDataGrid.ItemsSource = $ObservableCollection
+                }
+                
+                $ObservableCollection.AddRange($newEntries)
+
+                if ($ScrollBtn.IsChecked) {
+                    if ($LogDataGrid.Items.Count -gt 0) { $LogDataGrid.ScrollIntoView($LogDataGrid.Items[$LogDataGrid.Items.Count - 1]) }
+                }
+            }
         }
     } catch {}
 })
@@ -850,7 +878,7 @@ function Perform-Search {
 if (-not [string]::IsNullOrWhiteSpace($script:Config.LastLogFile) -and (Test-Path $script:Config.LastLogFile)) {
     $script:CurrentLogFile = $script:Config.LastLogFile
     $Window.Title = "Configuration Manager Trace Log Tool - $($script:Config.LastLogFile)"
-    Update-LogData
+    Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $true
 }
 
 # Show Main Window
