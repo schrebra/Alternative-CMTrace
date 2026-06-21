@@ -32,7 +32,6 @@ if (-not ("LogParser" -as [type])) {
         }
     }
     public static class LogParser {
-        // OPTIMIZATION: Use Generic Dictionary to eliminate boxing/unboxing overhead
         public static LogEntry ParseLine(string line, Dictionary<string, string> keywords) {
             if (line.StartsWith("<![LOG[", StringComparison.Ordinal) && line.Contains("]LOG]!>")) {
                 int msgStart = 7; // "<![LOG[".Length
@@ -41,15 +40,13 @@ if (-not ("LogParser" -as [type])) {
                 
                 string rawMsg = line.Substring(msgStart, msgEnd - msgStart);
                 
-                // Find type
                 int typeStart = line.IndexOf("type=\"", msgEnd, StringComparison.Ordinal);
                 if (typeStart < 0) return null;
-                typeStart += 6; // "type=\"".Length
+                typeStart += 6;
                 int typeEnd = line.IndexOf("\"", typeStart, StringComparison.Ordinal);
                 if (typeEnd < 0) return null;
                 string typeVal = line.Substring(typeStart, typeEnd - typeStart);
                 
-                // Find time
                 int timeStart = line.IndexOf("time=\"", msgEnd, StringComparison.Ordinal);
                 if (timeStart < 0) return null;
                 timeStart += 6;
@@ -57,7 +54,6 @@ if (-not ("LogParser" -as [type])) {
                 if (timeEnd < 0) return null;
                 string timeStr = line.Substring(timeStart, timeEnd - timeStart);
                 
-                // Find date
                 int dateStart = line.IndexOf("date=\"", msgEnd, StringComparison.Ordinal);
                 if (dateStart < 0) return null;
                 dateStart += 6;
@@ -65,7 +61,6 @@ if (-not ("LogParser" -as [type])) {
                 if (dateEnd < 0) return null;
                 string dateStr = line.Substring(dateStart, dateEnd - dateStart);
 
-                // OPTIMIZATION: Slice timezone offset from timeStr BEFORE concatenation to save allocations
                 int tzIndex = timeStr.IndexOfAny(new char[] { '+', '-' });
                 string cleanTime = (tzIndex > 0) ? timeStr.Substring(0, tzIndex) : timeStr;
                 
@@ -269,90 +264,82 @@ Load-Config
  $bgScript = {
     param($FilePath, $Keywords, $LogQueue, $CancellationToken, $SharedState)
     
-    $stream = $null
-    $reader = $null
     $lastFileLength = $SharedState.LastFileLength
     $pendingBuffer = $SharedState.PendingBuffer
-    $buffer = New-Object System.Text.StringBuilder # Instantiated once outside the loop for zero GC pressure
+    $buffer = New-Object System.Text.StringBuilder
     
-    try {
-        while (-not $CancellationToken.IsCancellationRequested) {
-            try {
-                if (-not (Test-Path $FilePath)) { Start-Sleep -Seconds 2; continue }
+    while (-not $CancellationToken.IsCancellationRequested) {
+        $reader = $null
+        try {
+            if (-not (Test-Path $FilePath)) { Start-Sleep -Milliseconds 500; continue }
+            
+            $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
+            if ($null -eq $fileInfo) { Start-Sleep -Milliseconds 500; continue }
+            
+            $currentLength = $fileInfo.Length
+            
+            if ($currentLength -lt $lastFileLength) {
+                $lastFileLength = 0
+                $pendingBuffer = ""
+            }
+            
+            if ($currentLength -gt $lastFileLength) {
+                # Open, read delta, and immediately close to prevent file locking
+                $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $reader = New-Object System.IO.StreamReader($stream, $true)
                 
-                $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
-                if ($null -eq $fileInfo) { Start-Sleep -Seconds 2; continue }
+                $reader.BaseStream.Seek($lastFileLength, [System.IO.SeekOrigin]::Begin) | Out-Null
+                $lastFileLength = $currentLength
                 
-                $currentLength = $fileInfo.Length
-                
-                if ($currentLength -lt $lastFileLength) {
-                    $lastFileLength = 0
+                [void]$buffer.Clear()
+                if ($pendingBuffer.Length -gt 0) {
+                    [void]$buffer.Append($pendingBuffer)
                     $pendingBuffer = ""
                 }
                 
-                if ($currentLength -gt $lastFileLength) {
-                    if ($null -eq $stream -or $stream.SafeFileHandle.IsClosed -or $stream.SafeFileHandle.IsInvalid) {
-                        if ($stream -ne $null) { $stream.Dispose() }
-                        if ($reader -ne $null) { $reader.Dispose() }
-                        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
-                        $reader = New-Object System.IO.StreamReader($stream, $true)
+                while (($line = $reader.ReadLine()) -ne $null) {
+                    if ($line.StartsWith('<![LOG[') -and $buffer.Length -gt 0) { 
+                        $entry = [LogParser]::ParseLine($buffer.ToString(), $Keywords)
+                        if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
+                        [void]$buffer.Clear().Append($line)
                     }
-                    
-                    $reader.BaseStream.Seek($lastFileLength, [System.IO.SeekOrigin]::Begin) | Out-Null
-                    $lastFileLength = $currentLength
-                    
-                    [void]$buffer.Clear()
-                    if ($pendingBuffer.Length -gt 0) {
-                        [void]$buffer.Append($pendingBuffer)
-                        $pendingBuffer = ""
+                    elseif ($line.StartsWith('<![LOG[')) { 
+                        [void]$buffer.Clear().Append($line)
                     }
-                    
-                    while (($line = $reader.ReadLine()) -ne $null) {
-                        if ($line.StartsWith('<![LOG[') -and $buffer.Length -gt 0) { 
-                            $entry = [LogParser]::ParseLine($buffer.ToString(), $Keywords)
-                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
-                            [void]$buffer.Clear().Append($line)
-                        }
-                        elseif ($line.StartsWith('<![LOG[')) { 
-                            [void]$buffer.Clear().Append($line)
-                        }
-                        elseif ($buffer.Length -gt 0) { 
-                            [void]$buffer.AppendLine($line)
-                        }
-                        else { 
-                            $entry = [LogParser]::ParseLine($line, $Keywords)
-                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
-                        }
+                    elseif ($buffer.Length -gt 0) { 
+                        [void]$buffer.AppendLine($line)
                     }
-                    
-                    if ($buffer.Length -gt 0) {
-                        $bufferStr = $buffer.ToString()
-                        if ($bufferStr.StartsWith('<![LOG[') -and -not $bufferStr.Contains("]LOG]!>")) {
-                            $pendingBuffer = $bufferStr
-                        } else {
-                            $entry = [LogParser]::ParseLine($bufferStr, $Keywords)
-                            if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
-                        }
+                    else { 
+                        $entry = [LogParser]::ParseLine($line, $Keywords)
+                        if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
                     }
                 }
-            } catch [System.IO.IOException] {
-                # File locked or temporarily unavailable
-                Start-Sleep -Milliseconds 500
-                continue
-            } catch {
-                # Catch all to prevent runspace crash
-                Start-Sleep -Milliseconds 500
-                continue
+                
+                if ($buffer.Length -gt 0) {
+                    $bufferStr = $buffer.ToString()
+                    if ($bufferStr.StartsWith('<![LOG[') -and -not $bufferStr.Contains("]LOG]!>")) {
+                        $pendingBuffer = $bufferStr
+                    } else {
+                        $entry = [LogParser]::ParseLine($bufferStr, $Keywords)
+                        if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
+                    }
+                }
             }
-            Start-Sleep -Milliseconds 500 # Tail loop delay
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 500
+            continue
+        } catch {
+            Start-Sleep -Milliseconds 500
+            continue
+        } finally {
+            # CRITICAL: Dispose reader immediately to release the file lock for other processes (like Add-Content)
+            if ($reader -ne $null) { $reader.Dispose() }
         }
+        Start-Sleep -Milliseconds 500 # Tail loop delay
     }
-    finally {
-        if ($reader -ne $null) { $reader.Dispose() }
-        if ($stream -ne $null) { $stream.Dispose() }
-        $SharedState.LastFileLength = $lastFileLength
-        $SharedState.PendingBuffer = $pendingBuffer
-    }
+    
+    $SharedState.LastFileLength = $lastFileLength
+    $SharedState.PendingBuffer = $pendingBuffer
 }
 
 # --- Main XAML UI ---
@@ -516,7 +503,6 @@ function Start-LogTailing {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[LogEntry]]::new()
     }
 
-    # OPTIMIZATION: Convert PS Hashtable to Generic Dictionary to prevent C# boxing/unboxing
     $typedKeywords = [System.Collections.Generic.Dictionary[string,string]]::new()
     foreach($kv in $script:Config.Keywords.GetEnumerator()) {
         $typedKeywords[$kv.Key] = $kv.Value
@@ -819,7 +805,6 @@ function Perform-Search {
         Save-Config
         Apply-ConfigToGui
         
-        # Re-evaluate levels on existing UI items
         $typedKeywords = [System.Collections.Generic.Dictionary[string,string]]::new()
         foreach($kv in $script:Config.Keywords.GetEnumerator()) { $typedKeywords[$kv.Key] = $kv.Value }
 
@@ -833,7 +818,6 @@ function Perform-Search {
             $LogDataGrid.ItemsSource = $items
         }
 
-        # Restart background runspace to pick up new keywords, preserving file position
         if ($script:CurrentLogFile -ne $null -and -not $PauseBtn.IsChecked) {
             Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $false
         }
@@ -850,9 +834,8 @@ function Perform-Search {
 })
 
 # --- The Consumer: WPF DispatcherTimer ---
-# Drains the ConcurrentQueue on the UI thread without touching the disk
  $script:RefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
- $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(200) # 200ms for ultra-snappy UI
+ $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(200)
  $script:RefreshTimer.Add_Tick({
     try {
         if ($script:LogQueue -ne $null -and -not $script:LogQueue.IsEmpty) {
@@ -861,7 +844,6 @@ function Perform-Search {
             $maxItemsPerTick = 5000
             $count = 0
             
-            # Throttle dequeue to 5000 items per tick to prevent UI stutter on massive log dumps
             while ($script:LogQueue.TryDequeue([ref]$entry) -and $count -lt $maxItemsPerTick) {
                 $newEntries.Add($entry)
                 $count++
@@ -885,12 +867,10 @@ function Perform-Search {
 })
  $script:RefreshTimer.Start()
 
-# Auto-load last log file if it exists
 if (-not [string]::IsNullOrWhiteSpace($script:Config.LastLogFile) -and (Test-Path $script:Config.LastLogFile)) {
     $script:CurrentLogFile = $script:Config.LastLogFile
     $Window.Title = "Configuration Manager Trace Log Tool - $($script:Config.LastLogFile)"
     Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $true
 }
 
-# Show Main Window
  $Window.ShowDialog() | Out-Null
