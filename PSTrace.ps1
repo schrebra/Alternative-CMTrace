@@ -32,7 +32,8 @@ if (-not ("LogParser" -as [type])) {
         }
     }
     public static class LogParser {
-        public static LogEntry ParseLine(string line, System.Collections.Hashtable keywords) {
+        // OPTIMIZATION: Use Generic Dictionary to eliminate boxing/unboxing overhead
+        public static LogEntry ParseLine(string line, Dictionary<string, string> keywords) {
             if (line.StartsWith("<![LOG[", StringComparison.Ordinal) && line.Contains("]LOG]!>")) {
                 int msgStart = 7; // "<![LOG[".Length
                 int msgEnd = line.IndexOf("]LOG]!>", msgStart, StringComparison.Ordinal);
@@ -64,20 +65,20 @@ if (-not ("LogParser" -as [type])) {
                 if (dateEnd < 0) return null;
                 string dateStr = line.Substring(dateStart, dateEnd - dateStart);
 
-                string combinedStr = dateStr + " " + timeStr;
+                // OPTIMIZATION: Slice timezone offset from timeStr BEFORE concatenation to save allocations
+                int tzIndex = timeStr.IndexOfAny(new char[] { '+', '-' });
+                string cleanTime = (tzIndex > 0) ? timeStr.Substring(0, tzIndex) : timeStr;
+                
+                string combinedStr = string.Concat(dateStr, " ", cleanTime);
                 DateTime dt = DateTime.Now;
-                int tzIndex = combinedStr.IndexOfAny(new char[] { '+', '-' });
-                if (tzIndex > 0) {
-                    combinedStr = combinedStr.Substring(0, tzIndex);
-                }
                 if (!DateTime.TryParse(combinedStr, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out dt)) {
                     dt = DateTime.Now;
                 }
 
                 string level = "Info";
-                foreach (System.Collections.DictionaryEntry kw in keywords) {
-                    if (rawMsg.IndexOf((string)kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
-                        level = (string)kw.Key;
+                foreach (var kw in keywords) {
+                    if (rawMsg.IndexOf(kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        level = kw.Key;
                         break;
                     }
                 }
@@ -95,9 +96,9 @@ if (-not ("LogParser" -as [type])) {
                 };
             } else {
                 string level = "Info";
-                foreach (System.Collections.DictionaryEntry kw in keywords) {
-                    if (line.IndexOf((string)kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
-                        level = (string)kw.Key;
+                foreach (var kw in keywords) {
+                    if (line.IndexOf(kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        level = kw.Key;
                         break;
                     }
                 }
@@ -515,12 +516,18 @@ function Start-LogTailing {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[LogEntry]]::new()
     }
 
+    # OPTIMIZATION: Convert PS Hashtable to Generic Dictionary to prevent C# boxing/unboxing
+    $typedKeywords = [System.Collections.Generic.Dictionary[string,string]]::new()
+    foreach($kv in $script:Config.Keywords.GetEnumerator()) {
+        $typedKeywords[$kv.Key] = $kv.Value
+    }
+
     $script:Cts = New-Object System.Threading.CancellationTokenSource
 
     $script:RunspacePS = [System.Management.Automation.PowerShell]::Create()
     $script:RunspacePS.AddScript($bgScript).
         AddArgument($FilePath).
-        AddArgument($script:Config.Keywords).
+        AddArgument($typedKeywords).
         AddArgument($script:LogQueue).
         AddArgument($script:Cts.Token).
         AddArgument($script:SharedState) | Out-Null
@@ -812,11 +819,15 @@ function Perform-Search {
         Save-Config
         Apply-ConfigToGui
         
+        # Re-evaluate levels on existing UI items
+        $typedKeywords = [System.Collections.Generic.Dictionary[string,string]]::new()
+        foreach($kv in $script:Config.Keywords.GetEnumerator()) { $typedKeywords[$kv.Key] = $kv.Value }
+
         $items = $LogDataGrid.ItemsSource
         if ($items -is [ObservableRangeCollection[LogEntry]]) {
             $LogDataGrid.ItemsSource = $null
             foreach ($item in $items) {
-                $parsed = [LogParser]::ParseLine($item.RawMsg, $script:Config.Keywords)
+                $parsed = [LogParser]::ParseLine($item.RawMsg, $typedKeywords)
                 if ($parsed -ne $null) { $item.Level = $parsed.Level }
             }
             $LogDataGrid.ItemsSource = $items
