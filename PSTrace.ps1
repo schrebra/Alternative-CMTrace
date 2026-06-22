@@ -14,6 +14,7 @@ if (-not ("LogParser" -as [type])) {
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
     using System.Collections.Specialized;
+    using System.ComponentModel;
 
     public class KeywordItem {
         public string Key { get; set; }
@@ -27,7 +28,10 @@ if (-not ("LogParser" -as [type])) {
     }
     public class ObservableRangeCollection<T> : ObservableCollection<T> {
         public void AddRange(IEnumerable<T> collection) {
+            CheckReentrancy();
             foreach (var i in collection) { Items.Add(i); }
+            OnPropertyChanged(new PropertyChangedEventArgs("Count"));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
             OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
         }
     }
@@ -324,6 +328,11 @@ Load-Config
                         if ($entry -ne $null) { $LogQueue.Enqueue($entry) }
                     }
                 }
+
+                # If this was the initial read, mark it complete
+                if (-not $SharedState.InitialLoadComplete) {
+                    $SharedState.InitialLoadComplete = $true
+                }
             }
         } catch [System.IO.IOException] {
             Start-Sleep -Milliseconds 500
@@ -497,8 +506,18 @@ function Start-LogTailing {
     Stop-LogTailing
 
     if ($ResetState -or $script:SharedState -eq $null) {
-        $script:SharedState = @{ LastFileLength = 0; PendingBuffer = "" }
+        $script:SharedState = @{ 
+            LastFileLength = 0; 
+            PendingBuffer = ""; 
+            InitialLoadComplete = $false; 
+            IsFlushingInitialQueue = $true 
+        }
+        # Ensure UI timer is fast for the load
+        $script:RefreshTimer.Stop()
+        $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+        $script:RefreshTimer.Start()
     }
+    
     if ($script:LogQueue -eq $null) {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[LogEntry]]::new()
     }
@@ -823,9 +842,12 @@ function Perform-Search {
         }
 
         try {
-            $script:RefreshTimer.Stop()
-            $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds([int]$SpeedCombo.SelectedItem)
-            $script:RefreshTimer.Start()
+            # Only update interval if we are not in the middle of an initial load
+            if (-not ($script:SharedState -ne $null -and $script:SharedState.IsFlushingInitialQueue)) {
+                $script:RefreshTimer.Stop()
+                $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds([int]$SpeedCombo.SelectedItem)
+                $script:RefreshTimer.Start()
+            }
         } catch {}
         $sWindow.Close()
     })
@@ -835,13 +857,29 @@ function Perform-Search {
 
 # --- The Consumer: WPF DispatcherTimer ---
  $script:RefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
- $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+ $script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds(100)
  $script:RefreshTimer.Add_Tick({
     try {
+        # If background reader finished initial read, and we are still flushing the UI queue
+        if ($script:SharedState -ne $null -and $script:SharedState.InitialLoadComplete -and $script:SharedState.IsFlushingInitialQueue) {
+            if ($script:LogQueue -eq $null -or $script:LogQueue.IsEmpty) {
+                # Queue is empty, initial load is truly complete!
+                $script:SharedState.IsFlushingInitialQueue = $false
+                $script:RefreshTimer.Stop()
+                $script:RefreshTimer.Interval = [TimeSpan]::FromSeconds([int]$script:Config.UpdateSpeed)
+                $script:RefreshTimer.Start()
+                
+                # Ensure we jump to the bottom when initial load truly finishes
+                if ($ScrollBtn.IsChecked -and $LogDataGrid.Items.Count -gt 0) {
+                    $LogDataGrid.ScrollIntoView($LogDataGrid.Items[$LogDataGrid.Items.Count - 1])
+                }
+            }
+        }
+
         if ($script:LogQueue -ne $null -and -not $script:LogQueue.IsEmpty) {
-            $newEntries = New-Object System.Collections.Generic.List[LogEntry]
+            $newEntries = New-Object System.Collections.Generic.List[LogEntry](25000)
             $entry = $null
-            $maxItemsPerTick = 5000
+            $maxItemsPerTick = 25000
             $count = 0
             
             while ($script:LogQueue.TryDequeue([ref]$entry) -and $count -lt $maxItemsPerTick) {
@@ -859,7 +897,15 @@ function Perform-Search {
                 $ObservableCollection.AddRange($newEntries)
 
                 if ($ScrollBtn.IsChecked) {
-                    if ($LogDataGrid.Items.Count -gt 0) { $LogDataGrid.ScrollIntoView($LogDataGrid.Items[$LogDataGrid.Items.Count - 1]) }
+                    $shouldScroll = $true
+                    # If we are flushing the initial queue, wait for it to be empty before scrolling to bottom
+                    if ($script:SharedState -ne $null -and $script:SharedState.IsFlushingInitialQueue -and -not $script:LogQueue.IsEmpty) {
+                        $shouldScroll = $false
+                    }
+                    
+                    if ($shouldScroll -and $LogDataGrid.Items.Count -gt 0) {
+                        $LogDataGrid.ScrollIntoView($LogDataGrid.Items[$LogDataGrid.Items.Count - 1])
+                    }
                 }
             }
         }
