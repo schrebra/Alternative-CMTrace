@@ -480,11 +480,11 @@ public static class LogParser {
 
 #region --- Named Constants ---
 
-$script:MaxDrainPerTick     = 25000
+$script:MaxDrainPerTick     = 50000
 $script:PollIntervalMs      = 500
-$script:InitialCapacity     = 50000
+$script:InitialCapacity     = 200000
 $script:FastTimerIntervalMs = 100
-$script:MaxRetainedEntries  = 100000
+$script:MaxRetainedEntries  = 2000000
 $script:TrimThreshold       = [int]($script:MaxRetainedEntries * 1.1)
 $script:MinFontSize         = 6
 $script:MaxFontSize         = 72
@@ -1322,7 +1322,7 @@ function Set-StatsSort {
         $script:Config.StatsSortDirection = "Ascending"
     }
     Update-SortButtonLabels
-    Update-StatusBar
+    Update-StatusBar -Force
 }
 
 $SortTypeBtn.Add_Click({  Set-StatsSort -Column "Type" })
@@ -1331,7 +1331,10 @@ $SortPctBtn.Add_Click({   Set-StatsSort -Column "Percentage" })
 
 Update-SortButtonLabels
 
+$script:LastStatsUpdate = [DateTime]::MinValue
+
 function Update-StatusBar {
+    param([switch]$Force)
     $masterList        = $script:State.MasterList
     $displayCollection = $script:State.DisplayCollection
     $cache             = $script:State.StatsRowCache
@@ -1347,6 +1350,11 @@ function Update-StatusBar {
         $cache.Clear()
         return
     }
+
+    if (-not $Force -and ([DateTime]::Now - $script:LastStatsUpdate).TotalMilliseconds -lt 1000) {
+        return
+    }
+    $script:LastStatsUpdate = [DateTime]::Now
 
     $stats       = [LogParser]::GetLevelStatistics($displayCollection)
     $sortedStats = Get-SortedStats -Stats $stats
@@ -1547,7 +1555,7 @@ function Invoke-ApplyFilter {
     if ($ScrollBtn.IsChecked -and $script:State.DisplayCollection.Count -gt 0) {
         $LogDataGrid.ScrollIntoView($script:State.DisplayCollection[$script:State.DisplayCollection.Count - 1])
     }
-    Update-StatusBar
+    Update-StatusBar -Force
 }
 
 function Add-VisibleEntries {
@@ -1651,7 +1659,7 @@ function Start-LogTailing {
         Stop-LogTailing
         try { Set-TimerInterval ([TimeSpan]::FromSeconds($script:Config.UpdateSpeed)) } catch {}
     }
-    Update-StatusBar
+    Update-StatusBar -Force
 }
 
 #endregion
@@ -1796,7 +1804,7 @@ $PauseBtn.Add_Click({
             Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $false
         }
     }
-    Update-StatusBar
+    Update-StatusBar -Force
 })
 
 $ScrollBtn.Add_Click({
@@ -1884,7 +1892,7 @@ $OpenMenu.Add_Click({
         Invoke-RebuildFilterBar
         Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $true
         $OpenLogOverlay.Visibility      = [System.Windows.Visibility]::Collapsed
-        Update-StatusBar
+        Update-StatusBar -Force
     }
 })
 
@@ -2407,6 +2415,7 @@ $script:RefreshTimer.Add_Tick({
                     if ($ScrollBtn.IsChecked -and $appState.DisplayCollection.Count -gt 0) {
                         $LogDataGrid.ScrollIntoView($appState.DisplayCollection[$appState.DisplayCollection.Count - 1])
                     }
+                    Update-StatusBar -Force
                 }
             }
         }
@@ -2459,7 +2468,12 @@ $script:RefreshTimer.Add_Tick({
             [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
             try { $stillFlushing2 = $sharedState.IsFlushingInitialQueue }
             finally { [System.Threading.Monitor]::Exit($sharedState.SyncRoot) }
-            if ($stillFlushing2) { Update-StatusBar }
+            if ($stillFlushing2) { 
+                if ($null -ne $TotalCountText) { 
+                    $total = if ($null -ne $appState.MasterList) { $appState.MasterList.Count } else { 0 }
+                    $TotalCountText.Text = $total.ToString("N0") 
+                }
+            }
         }
 
     } catch {
@@ -2483,7 +2497,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:Config.LastLogFile) -and (Test-Pat
 
 #region --- Start ---
 
-Update-StatusBar
+Update-StatusBar -Force
 $script:RefreshTimer.Start()
 
 try {
