@@ -238,6 +238,31 @@ if (-not ("LogParser" -as [type])) {
             return -1;
         }
 
+        // -------------------------------------------------------------------
+        // GetLevelCounts — counts the occurrences of each Level in the
+        // supplied list and returns a formatted string.
+        // Implemented in C# for O(n) performance without PowerShell overhead.
+        // -------------------------------------------------------------------
+        public static string GetLevelCounts(IList<LogEntry> items) {
+            if (items == null || items.Count == 0) return "";
+            var counts = new System.Collections.Generic.Dictionary<string, int>(
+                System.StringComparer.OrdinalIgnoreCase);
+            foreach (var e in items) {
+                if (e == null || string.IsNullOrEmpty(e.Level)) continue;
+                int c;
+                if (!counts.TryGetValue(e.Level, out c)) c = 0;
+                counts[e.Level] = c + 1;
+            }
+            var keys = new System.Collections.Generic.List<string>(counts.Keys);
+            keys.Sort(System.StringComparer.OrdinalIgnoreCase);
+            var sb = new System.Text.StringBuilder();
+            foreach (var k in keys) {
+                if (sb.Length > 0) sb.Append("   |   ");
+                sb.Append(k).Append(": ").Append(counts[k]);
+            }
+            return sb.ToString();
+        }
+
         public static LogEntry ParseLine(string line,
                                          List<KeyValuePair<string,string>> orderedKeywords) {
             // Reject null and oversized lines before any further processing.
@@ -912,6 +937,7 @@ Import-Config
             <RowDefinition Height="5"/>
             <RowDefinition Height="$(ConvertTo-XmlSafe $script:Config.BottomPanelHeight)"
                            MinHeight="80"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- Menu -->
@@ -1003,6 +1029,17 @@ Import-Config
                  HorizontalScrollBarVisibility="Auto"
                  TextWrapping="Wrap"
                  Padding="5,5,5,5"/>
+        
+        <!-- Status Bar -->
+        <StatusBar Grid.Row="6" Background="#FFF0F0F0" BorderBrush="#FFD0D0D0" BorderThickness="0,1,0,0">
+            <StatusBarItem DockPanel.Dock="Left">
+                <TextBlock Name="TypeCountText" Text=""/>
+            </StatusBarItem>
+            <StatusBarItem DockPanel.Dock="Right">
+                <TextBlock Name="LineCountText" Text="Lines: 0 (0 shown)" HorizontalAlignment="Right"/>
+            </StatusBarItem>
+            <StatusBarItem/>
+        </StatusBar>
     </Grid>
 </Window>
 "@
@@ -1027,6 +1064,31 @@ try {
  $SearchBtn      = $Window.FindName("SearchBtn")
  $ClearSearchBtn = $Window.FindName("ClearSearchBtn")
  $FilterPanel    = $Window.FindName("FilterPanel")
+ $LineCountText  = $Window.FindName("LineCountText")
+ $TypeCountText  = $Window.FindName("TypeCountText")
+
+# ---------------------------------------------------------------------------
+# Update-StatusBar — refreshes the line count and type counts.
+# Called from every code path that adds, removes, or filters entries so the
+# count stays in sync with the actual state of MasterList / DisplayCollection.
+# ---------------------------------------------------------------------------
+function Update-StatusBar {
+    if ($null -eq $LineCountText) { return }
+    $total = 0
+    if ($null -ne $script:MasterList) { $total = $script:MasterList.Count }
+    $visible = 0
+    if ($null -ne $script:DisplayCollection) { $visible = $script:DisplayCollection.Count }
+    $LineCountText.Text = "Lines: $total ($visible shown)"
+
+    if ($null -ne $TypeCountText) {
+        $typeStr = ""
+        if ($visible -gt 0) {
+            # Compute counts natively in C# for performance on large lists
+            $typeStr = [LogParser]::GetLevelCounts($script:DisplayCollection)
+        }
+        $TypeCountText.Text = $typeStr
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Keyboard shortcuts — Ctrl+O and Ctrl+F handled at window level so they
@@ -1212,6 +1274,8 @@ function Invoke-ApplyFilter {
         $script:LogDataGrid.ScrollIntoView(
             $script:DisplayCollection[$script:DisplayCollection.Count - 1])
     }
+
+    Update-StatusBar
 }
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1298,8 @@ function Add-VisibleEntries {
             Write-OperationalError "Add-VisibleEntries" "AddRange reentrancy error: $_"
         }
     }
+
+    Update-StatusBar
 }
 
 # ---------------------------------------------------------------------------
@@ -1329,6 +1395,8 @@ function Start-LogTailing {
         # Clean up whatever was partially created.
         Stop-LogTailing
     }
+
+    Update-StatusBar
 }
 
 # ---------------------------------------------------------------------------
@@ -1504,6 +1572,7 @@ Invoke-RebuildFilterBar
             Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $false
         }
     }
+    Update-StatusBar
 })
 
  $ScrollBtn.Add_Click({
@@ -1538,6 +1607,7 @@ Invoke-RebuildFilterBar
 
         Invoke-RebuildFilterBar
         Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $true
+        Update-StatusBar
     }
 })
 
@@ -2167,6 +2237,13 @@ function Find-NextMatch {
                 }
             }
         }
+
+        # Keep the status bar live during initial load so the user sees the
+        # line count climbing as entries stream in.
+        if ($null -ne $script:SharedState -and
+            $script:SharedState["IsFlushingInitialQueue"]) {
+            Update-StatusBar
+        }
     } catch {
         Write-OperationalError "RefreshTimer.Tick" "$_"
     }
@@ -2187,5 +2264,8 @@ if (-not [string]::IsNullOrWhiteSpace($script:Config.LastLogFile) -and
     Invoke-RebuildFilterBar
     Start-LogTailing -FilePath $script:CurrentLogFile -ResetState $true
 }
+
+# Ensure the status bar reflects the initial state before the window opens.
+Update-StatusBar
 
 [void]$Window.ShowDialog()
