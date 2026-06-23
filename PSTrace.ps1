@@ -1,4 +1,3 @@
-
 # ===========================================================================
 # Configuration Manager Trace Log Tool
 # Requires: PowerShell 5.1+, STA thread, 64-bit host
@@ -296,6 +295,15 @@ public class ObservableRangeCollection<T> : ObservableCollection<T> {
     }
 }
 
+public class SharedLogState : MarshalByRefObject {
+    public long LastFileLength;
+    public string PendingBuffer = "";
+    public bool InitialLoadComplete;
+    public bool IsFlushingInitialQueue = true;
+    public string LastError;
+    public readonly object SyncRoot = new object();
+}
+
 public static class LogParser {
 
     private const int MaxLineLength = 1048576;
@@ -492,6 +500,7 @@ $script:RunspaceShutdownMs  = 2000
 $script:MaxErrorLogEntries  = 500
 $script:JsonFormatDepth     = 50
 $script:MaxIniLineLength    = 4096
+$script:MaxJsonFormatLength = 100000
 
 $script:SortColumns    = @("Type", "Count", "Percentage")
 $script:SortDirections = @("Ascending", "Descending")
@@ -537,8 +546,6 @@ function Report-Error {
 
 #region --- Colour Map (plain Hashtable - OrderedDictionary lacks ContainsKey) ---
 
-# Using a regular hashtable so that .ContainsKey() works correctly in PS5.1.
-# Insertion order is not required at runtime; only Keys enumeration is used.
 $script:ColorMap = @{
     "Red"    = "#FFFFCDD2"
     "Orange" = "#FFFFE0B2"
@@ -599,9 +606,6 @@ function Add-SlowScroll {
     })
 }
 
-# Set-TimerInterval must run on the UI dispatcher thread.
-# Because [System.Action] cannot be invoked with & in PS5.1 when stored as
-# a typed variable, we use a plain scriptblock and Invoke-Command instead.
 function Set-TimerInterval {
     param([TimeSpan]$Interval)
     $sb = {
@@ -669,7 +673,6 @@ function Clear-BrushCache {
     $script:BrushCache.Clear()
 }
 
-# Helper: test whether a key exists in a plain hashtable (works in PS5.1)
 function Test-ColorMapKey {
     param([string]$Key)
     return $script:ColorMap.ContainsKey($Key)
@@ -875,12 +878,12 @@ $bgScript = {
         [System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]] $OrderedKeywords,
         [System.Collections.Concurrent.ConcurrentQueue[object]] $LogQueue,
         [System.Threading.CancellationToken] $CancellationToken,
-        [hashtable] $SharedState,
+        [SharedLogState] $SharedState,
         [int] $PollIntervalMs
     )
 
-    $lastFileLength    = $SharedState["LastFileLength"]
-    $pendingBuffer     = $SharedState["PendingBuffer"]
+    $lastFileLength    = $SharedState.LastFileLength
+    $pendingBuffer     = $SharedState.PendingBuffer
     $buffer            = New-Object System.Text.StringBuilder
     $consecutiveErrors = 0
     $maxBackoffMs      = 30000
@@ -960,10 +963,10 @@ $bgScript = {
 
                 [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
                 try {
-                    $SharedState["LastFileLength"] = $lastFileLength
-                    $SharedState["PendingBuffer"]  = $pendingBuffer
-                    if (-not $SharedState["InitialLoadComplete"]) {
-                        $SharedState["InitialLoadComplete"] = $true
+                    $SharedState.LastFileLength = $lastFileLength
+                    $SharedState.PendingBuffer  = $pendingBuffer
+                    if (-not $SharedState.InitialLoadComplete) {
+                        $SharedState.InitialLoadComplete = $true
                     }
                 } finally {
                     [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
@@ -976,7 +979,7 @@ $bgScript = {
             $backoffMs = [Math]::Min($PollIntervalMs * [Math]::Pow(2, $consecutiveErrors), $maxBackoffMs)
             [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
             try {
-                $SharedState["LastError"] = "IO error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss') on '$FilePath': $_"
+                $SharedState.LastError = "IO error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss') on '$FilePath': $_"
             } finally {
                 [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
             }
@@ -987,7 +990,7 @@ $bgScript = {
             $backoffMs = [Math]::Min($PollIntervalMs * [Math]::Pow(2, $consecutiveErrors), $maxBackoffMs)
             [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
             try {
-                $SharedState["LastError"] = "Unexpected error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss'): $_"
+                $SharedState.LastError = "Unexpected error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss'): $_"
             } finally {
                 [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
             }
@@ -1249,7 +1252,7 @@ try {
         Report-Error "Init" "Could not resolve BottomRowDef - bottom panel height will not persist."
     }
 } catch {
-    Show-FatalError -Title "Unhandled startup error" -Context "Startup failed." -Exception $_.Exception
+    Show-FatalError -Title "Unhandled Startup error" -Context "Startup failed." -Exception $_.Exception
     return
 }
 
@@ -1271,6 +1274,7 @@ $script:State = @{
     ActiveLevelFilter = @{}
     StatsRowCache     = New-Object 'System.Collections.Generic.Dictionary[string,hashtable]'(
         [System.StringComparer]::OrdinalIgnoreCase)
+    WasTailingBeforeSearch = $false
 }
 
 #endregion
@@ -1607,20 +1611,14 @@ function Start-LogTailing {
     $st = $script:State
 
     if ($ResetState -or $null -eq $st.SharedState) {
-        $st.SharedState = [hashtable]::Synchronized(@{
-            LastFileLength         = [long]0
-            PendingBuffer          = ""
-            InitialLoadComplete    = $false
-            IsFlushingInitialQueue = $true
-            LastError              = $null
-        })
+        $st.SharedState = New-Object SharedLogState
         Set-TimerInterval ([TimeSpan]::FromMilliseconds($script:FastTimerIntervalMs))
     } else {
         [System.Threading.Monitor]::Enter($st.SharedState.SyncRoot)
         try {
-            $st.SharedState["InitialLoadComplete"]    = $false
-            $st.SharedState["IsFlushingInitialQueue"] = $true
-            $st.SharedState["LastError"]              = $null
+            $st.SharedState.InitialLoadComplete    = $false
+            $st.SharedState.IsFlushingInitialQueue = $true
+            $st.SharedState.LastError              = $null
         } finally {
             [System.Threading.Monitor]::Exit($st.SharedState.SyncRoot)
         }
@@ -1725,7 +1723,8 @@ function Format-LogDetails {
     $msg = $RawMsg
     if ($script:Config.FormatJson) {
         $trimMsg = $msg.TrimStart()
-        if ($trimMsg.StartsWith("{") -or $trimMsg.StartsWith("[")) {
+        # Added safety length check to prevent UI freezing on massive JSON logs
+        if ($trimMsg.Length -lt $script:MaxJsonFormatLength -and ($trimMsg.StartsWith("{") -or $trimMsg.StartsWith("["))) {
             try {
                 $msg = ($msg | ConvertFrom-Json -ErrorAction Stop | ConvertTo-Json -Depth $script:JsonFormatDepth)
             } catch {
@@ -1956,6 +1955,7 @@ function Find-NextMatch {
     if ([string]::IsNullOrWhiteSpace($searchText)) { return }
 
     if (-not $PauseBtn.IsChecked) {
+        $script:State.WasTailingBeforeSearch = $true
         $PauseBtn.IsChecked = $true
         $PauseBtn.Content   = "Resume Auto-Refresh"
         Stop-LogTailing
@@ -2006,6 +2006,15 @@ $ClearSearchBtn.Add_Click({
     if ($script:MainWindow.Title.EndsWith($script:SearchPausedSuffix)) {
         $script:MainWindow.Title = $script:MainWindow.Title.Substring(
             0, $script:MainWindow.Title.Length - $script:SearchPausedSuffix.Length)
+        
+        if ($script:State.WasTailingBeforeSearch) {
+            $PauseBtn.IsChecked = $false
+            $PauseBtn.Content   = "Pause Auto-Refresh"
+            if ($null -ne $script:State.CurrentLogFile) {
+                Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $false
+            }
+            $script:State.WasTailingBeforeSearch = $false
+        }
     }
 })
 
@@ -2328,7 +2337,7 @@ $SettingsMenu.Add_Click({
             $isStillFlushing = $false
             if ($null -ne $script:State.SharedState) {
                 [System.Threading.Monitor]::Enter($script:State.SharedState.SyncRoot)
-                try { $isStillFlushing = $script:State.SharedState["IsFlushingInitialQueue"] }
+                try { $isStillFlushing = $script:State.SharedState.IsFlushingInitialQueue }
                 finally { [System.Threading.Monitor]::Exit($script:State.SharedState.SyncRoot) }
             }
             if (-not $isStillFlushing) {
@@ -2361,8 +2370,8 @@ $script:RefreshTimer.Add_Tick({
             $lastError = $null
             [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
             try {
-                $lastError = $sharedState["LastError"]
-                if ($null -ne $lastError) { $sharedState["LastError"] = $null }
+                $lastError = $sharedState.LastError
+                if ($null -ne $lastError) { $sharedState.LastError = $null }
             } finally {
                 [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
             }
@@ -2377,8 +2386,8 @@ $script:RefreshTimer.Add_Tick({
 
             [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
             try {
-                $initialLoadComplete    = $sharedState["InitialLoadComplete"]
-                $isFlushingInitialQueue = $sharedState["IsFlushingInitialQueue"]
+                $initialLoadComplete    = $sharedState.InitialLoadComplete
+                $isFlushingInitialQueue = $sharedState.IsFlushingInitialQueue
             } finally {
                 [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
             }
@@ -2388,8 +2397,8 @@ $script:RefreshTimer.Add_Tick({
                 if ($queueEmpty) {
                     [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
                     try {
-                        if ($sharedState["IsFlushingInitialQueue"]) {
-                            $sharedState["IsFlushingInitialQueue"] = $false
+                        if ($sharedState.IsFlushingInitialQueue) {
+                            $sharedState.IsFlushingInitialQueue = $false
                         }
                     } finally {
                         [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
@@ -2432,7 +2441,7 @@ $script:RefreshTimer.Add_Tick({
                     if ($null -ne $sharedState) {
                         $stillFlushing = $false
                         [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-                        try { $stillFlushing = $sharedState["IsFlushingInitialQueue"] }
+                        try { $stillFlushing = $sharedState.IsFlushingInitialQueue }
                         finally { [System.Threading.Monitor]::Exit($sharedState.SyncRoot) }
                         if ($stillFlushing -and -not $logQueue.IsEmpty) {
                             $shouldScroll = $false
@@ -2448,7 +2457,7 @@ $script:RefreshTimer.Add_Tick({
         if ($null -ne $sharedState) {
             $stillFlushing2 = $false
             [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-            try { $stillFlushing2 = $sharedState["IsFlushingInitialQueue"] }
+            try { $stillFlushing2 = $sharedState.IsFlushingInitialQueue }
             finally { [System.Threading.Monitor]::Exit($sharedState.SyncRoot) }
             if ($stillFlushing2) { Update-StatusBar }
         }
