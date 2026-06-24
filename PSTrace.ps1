@@ -1,5 +1,5 @@
 # ===========================================================================
-# Configuration Manager Trace Log Tool
+# Configuration Manager Trace Log Tool - High-Performance Edition
 # Requires: PowerShell 5.1+, STA thread, 64-bit host
 # ===========================================================================
 
@@ -269,13 +269,23 @@ public class LevelCount {
 }
 
 public class ObservableRangeCollection<T> : ObservableCollection<T> {
+    private bool _suppressNotification = false;
 
     public void AddRange(IEnumerable<T> collection) {
         if (collection == null) return;
-        CheckReentrancy();
+        
         var list = new List<T>(collection);
         if (list.Count == 0) return;
-        foreach (var item in list) { Items.Add(item); }
+        
+        _suppressNotification = true;
+        try {
+            foreach (var item in list) {
+                Items.Add(item);
+            }
+        } finally {
+            _suppressNotification = false;
+        }
+        
         OnPropertyChanged(new PropertyChangedEventArgs("Count"));
         OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
         OnCollectionChanged(new NotifyCollectionChangedEventArgs(
@@ -283,15 +293,28 @@ public class ObservableRangeCollection<T> : ObservableCollection<T> {
     }
 
     public void ReplaceAll(IEnumerable<T> collection) {
-        CheckReentrancy();
-        Items.Clear();
-        if (collection != null) {
-            foreach (var item in collection) { Items.Add(item); }
+        _suppressNotification = true;
+        try {
+            Items.Clear();
+            if (collection != null) {
+                foreach (var item in collection) {
+                    Items.Add(item);
+                }
+            }
+        } finally {
+            _suppressNotification = false;
         }
+        
         OnPropertyChanged(new PropertyChangedEventArgs("Count"));
         OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
         OnCollectionChanged(new NotifyCollectionChangedEventArgs(
             NotifyCollectionChangedAction.Reset));
+    }
+
+    protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e) {
+        if (!_suppressNotification) {
+            base.OnCollectionChanged(e);
+        }
     }
 }
 
@@ -432,28 +455,9 @@ public static class LogParser {
             if (timeEnd < 0) return null;
             string timeStr = line.Substring(timeStart, timeEnd - timeStart);
 
-            int dateStart = line.IndexOf("date=\"", msgEnd, StringComparison.Ordinal);
-            if (dateStart < 0) return null;
-            dateStart += 6;
-            int dateEnd = line.IndexOf("\"", dateStart, StringComparison.Ordinal);
-            if (dateEnd < 0) return null;
-            string dateStr = line.Substring(dateStart, dateEnd - dateStart);
+            string timestamp = timeStr.Length >= 12 ? "[" + timeStr.Substring(0, 12) + "]" : "[??:??:??.???]";
 
-            int tzIndex      = timeStr.IndexOfAny(new char[] { '+', '-' });
-            string cleanTime = (tzIndex > 0) ? timeStr.Substring(0, tzIndex) : timeStr;
-
-            DateTime dt;
-            bool parsed = DateTime.TryParse(
-                dateStr + " " + cleanTime,
-                System.Globalization.CultureInfo.InvariantCulture,
-                System.Globalization.DateTimeStyles.None,
-                out dt);
-            if (!parsed) dt = DateTime.MinValue;
-
-            string level     = DetermineLevel(rawMsg, typeVal, orderedKeywords);
-            string timestamp = (dt == DateTime.MinValue)
-                ? "[??:??:??.???]"
-                : "[" + dt.ToString("HH:mm:ss.fff") + "]";
+            string level = DetermineLevel(rawMsg, typeVal, orderedKeywords);
 
             return new LogEntry {
                 Message = timestamp + " " + rawMsg,
@@ -480,11 +484,11 @@ public static class LogParser {
 
 #region --- Named Constants ---
 
-$script:MaxDrainPerTick     = 50000
+$script:MaxDrainPerTick     = 10000
 $script:PollIntervalMs      = 500
-$script:InitialCapacity     = 200000
-$script:FastTimerIntervalMs = 100
-$script:MaxRetainedEntries  = 2000000
+$script:InitialCapacity     = 500000
+$script:FastTimerIntervalMs = 50
+$script:MaxRetainedEntries  = 10000000
 $script:TrimThreshold       = [int]($script:MaxRetainedEntries * 1.1)
 $script:MinFontSize         = 6
 $script:MaxFontSize         = 72
@@ -544,7 +548,7 @@ function Report-Error {
 
 #endregion
 
-#region --- Colour Map (plain Hashtable - OrderedDictionary lacks ContainsKey) ---
+#region --- Colour Map ---
 
 $script:ColorMap = @{
     "Red"    = "#FFFFCDD2"
@@ -916,7 +920,7 @@ $bgScript = {
                     [System.IO.FileShare]::ReadWrite)
 
                 try {
-                    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
+                    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 65536)
                     $stream = $null
                 } catch {
                     if ($null -ne $stream) { $stream.Dispose(); $stream = $null }
@@ -1084,8 +1088,7 @@ $script:MainXaml = @"
             <Grid Grid.Row="3">
                 <DataGrid Name="LogDataGrid"
                           Background="White" Foreground="Black"
-                          GridLinesVisibility="Horizontal"
-                          HorizontalGridLinesBrush="#FFD0D0D0"
+                          GridLinesVisibility="None"
                           HeadersVisibility="Column"
                           AutoGenerateColumns="False"
                           IsReadOnly="True"
@@ -1098,9 +1101,9 @@ $script:MainXaml = @"
                           BorderThickness="1,0,1,1" BorderBrush="#FFD0D0D0"
                           ScrollViewer.HorizontalScrollBarVisibility="Auto"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
-                          VirtualizingPanel.ScrollUnit="Pixel"
                           VirtualizingPanel.IsVirtualizing="True"
-                          VirtualizingPanel.VirtualizationMode="Recycling">
+                          VirtualizingPanel.VirtualizationMode="Recycling"
+                          VirtualizingPanel.ScrollUnit="Item">
                     <DataGrid.ContextMenu>
                         <ContextMenu>
                             <MenuItem Header="Copy to Clipboard" Name="ContextCopyMenu"/>
@@ -1276,6 +1279,8 @@ $script:State = @{
         [System.StringComparer]::OrdinalIgnoreCase)
     WasTailingBeforeSearch = $false
 }
+
+$script:LogScrollViewer = $null
 
 #endregion
 
@@ -1552,24 +1557,34 @@ function Invoke-ApplyFilter {
     }
     $visible = [LogParser]::FilterEntries($script:State.MasterList, $filterDict)
     $script:State.DisplayCollection.ReplaceAll($visible)
-    if ($ScrollBtn.IsChecked -and $script:State.DisplayCollection.Count -gt 0) {
-        $LogDataGrid.ScrollIntoView($script:State.DisplayCollection[$script:State.DisplayCollection.Count - 1])
+    
+    if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
+    if ($ScrollBtn.IsChecked -and $null -ne $script:LogScrollViewer) {
+        $script:LogScrollViewer.ScrollToEnd()
     }
     Update-StatusBar -Force
 }
 
 function Add-VisibleEntries {
     param([System.Collections.Generic.List[LogEntry]]$Entries)
-    $filterDict = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
-    foreach ($kv in $script:State.ActiveLevelFilter.GetEnumerator()) {
-        $filterDict[$kv.Key] = [bool]$kv.Value
+    
+    $allVisible = $true
+    foreach ($val in $script:State.ActiveLevelFilter.Values) {
+        if (-not $val) { $allVisible = $false; break }
     }
-    $toAdd = [LogParser]::FilterEntries($Entries, $filterDict)
-    if ($toAdd.Count -gt 0) {
-        try {
+    
+    if ($allVisible) {
+        if ($Entries.Count -gt 0) {
+            $script:State.DisplayCollection.AddRange($Entries)
+        }
+    } else {
+        $filterDict = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
+        foreach ($kv in $script:State.ActiveLevelFilter.GetEnumerator()) {
+            $filterDict[$kv.Key] = [bool]$kv.Value
+        }
+        $toAdd = [LogParser]::FilterEntries($Entries, $filterDict)
+        if ($toAdd.Count -gt 0) {
             $script:State.DisplayCollection.AddRange($toAdd)
-        } catch {
-            Report-Error "Add-VisibleEntries" "AddRange reentrancy error: $_"
         }
     }
     Update-StatusBar
@@ -1731,7 +1746,6 @@ function Format-LogDetails {
     $msg = $RawMsg
     if ($script:Config.FormatJson) {
         $trimMsg = $msg.TrimStart()
-        # Added safety length check to prevent UI freezing on massive JSON logs
         if ($trimMsg.Length -lt $script:MaxJsonFormatLength -and ($trimMsg.StartsWith("{") -or $trimMsg.StartsWith("["))) {
             try {
                 $msg = ($msg | ConvertFrom-Json -ErrorAction Stop | ConvertTo-Json -Depth $script:JsonFormatDepth)
@@ -2412,8 +2426,9 @@ $script:RefreshTimer.Add_Tick({
                         [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
                     }
                     Set-TimerInterval ([TimeSpan]::FromSeconds([int]$script:Config.UpdateSpeed))
-                    if ($ScrollBtn.IsChecked -and $appState.DisplayCollection.Count -gt 0) {
-                        $LogDataGrid.ScrollIntoView($appState.DisplayCollection[$appState.DisplayCollection.Count - 1])
+                    if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
+                    if ($ScrollBtn.IsChecked -and $null -ne $script:LogScrollViewer) {
+                        $script:LogScrollViewer.ScrollToEnd()
                     }
                     Update-StatusBar -Force
                 }
@@ -2456,8 +2471,11 @@ $script:RefreshTimer.Add_Tick({
                             $shouldScroll = $false
                         }
                     }
-                    if ($shouldScroll -and $appState.DisplayCollection.Count -gt 0) {
-                        $LogDataGrid.ScrollIntoView($appState.DisplayCollection[$appState.DisplayCollection.Count - 1])
+                    if ($shouldScroll) {
+                        if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
+                        if ($null -ne $script:LogScrollViewer) {
+                            $script:LogScrollViewer.ScrollToEnd()
+                        }
                     }
                 }
             }
