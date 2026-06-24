@@ -2,7 +2,8 @@
 
 A high-performance, WPF-based log viewer for PowerShell, specifically engineered to handle **massive log files (up to 2,000,000 lines)** with minimal memory overhead and near-instant parsing. It mimics the functionality of the classic `CMTrace` utility while providing modern customization, multithreaded file tailing, and regex/keyword-based highlighting.
 
-<img width="60%" alt="image" src="https://github.com/user-attachments/assets/dcaf0afb-7e5d-4fc9-b57b-2952f1a825af" />
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/85c2ddf4-a7c5-435f-ad51-f5575b9a14ad" />
+
 
 ## Key Features
 
