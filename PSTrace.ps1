@@ -1,2527 +1,3809 @@
 # ===========================================================================
-# Configuration Manager Trace Log Tool - High-Performance Edition
-# Requires: PowerShell 5.1+, STA thread, 64-bit host
+# PSTrace (Avalonia edition) - PowerShell bootstrap
+#
+# A rewrite of the WPF PSTrace.ps1 log viewer as a C# Avalonia application,
+# following the Powershell-Bootstrap-CSharp pattern: this single script
+# finds or installs a user-local .NET 8 SDK (no elevation), writes the
+# embedded C# sources into a clean workspace, publishes a self-contained
+# win-x64 executable, verifies it, and launches it.
+#
+# Usage:
+#   .\PSTrace.ps1                          build and launch the viewer
+#   .\PSTrace.ps1 -NoLaunch                build only
+#   .\PSTrace.ps1 -FilePath C:\logs\a.log build, launch, and open a.log
+#   .\PSTrace.ps1 C:\logs\a.log           same: a bare path is forwarded
+#
+# File arguments are forwarded to the published executable untouched, so
+# a shortcut that runs this script with a log path (or %1) opens that log,
+# exactly like dropping the file on the executable itself.
+# PositionalBinding is disabled so a bare file path can never be mistaken
+# for the project name parameter.
 # ===========================================================================
+[CmdletBinding(PositionalBinding=$false)]
+param([string]$ProjectName='PSTrace',[ValidateSet('Auto','Console','Avalonia')][string]$ProjectType='Avalonia',[string]$BaseDir='',[switch]$NoLaunch,[int]$MaxRetries=3,[string]$FilePath='', [Parameter(ValueFromRemainingArguments=$true)][string[]]$FileArgs=@())
+ $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+ $Script:StageName='Initialization';$Script:InstallerPath='';$Script:DotnetDir=Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet';$Script:AppKind='Avalonia'
+function Write-Info([string]$m){Write-Host $m -ForegroundColor Cyan}
+function Write-Ok([string]$m){Write-Host $m -ForegroundColor Green}
+function Write-Warn2([string]$m){Write-Host $m -ForegroundColor Yellow}
+function Write-Err2([string]$m){Write-Host $m -ForegroundColor Red}
+function Throw-Code([int]$c,[string]$m){throw "[$c] $m"}
+function Write-Stage([string]$n,[string]$m){Write-Host '';Write-Host "[$n] $m" -ForegroundColor Cyan}
+function Initialize-Tls{try{[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12}catch{};try{[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13}catch{}}
+function Get-SafeName([string]$n){
+ $n=[regex]::Replace($n,'[^A-Za-z0-9_]','');if($n.Length -eq 0){return 'GeneratedApp'};if($n -match '^\d'){$n='App'+$n};$n=$n.Substring(0,1).ToUpperInvariant()+$n.Substring(1)
+ $kw=@('abstract','as','async','await','base','bool','break','byte','case','catch','char','checked','class','const','continue','decimal','default','delegate','do','double','else','enum','event','explicit','extern','false','finally','fixed','float','for','foreach','goto','if','implicit','in','init','int','interface','internal','is','lock','long','namespace','new','null','object','operator','out','override','params','private','protected','public','readonly','record','ref','return','sbyte','sealed','short','sizeof','stackalloc','static','string','struct','switch','this','throw','true','try','typeof','uint','ulong','unchecked','unsafe','ushort','using','var','virtual','void','volatile','while');if($kw -contains $n.ToLowerInvariant()){$n=$n+'App'}
+return $n}
+function Remove-Folder([string]$Path){
+ $p=$Path.TrimEnd('\');if(-not (Test-Path -LiteralPath $p)){return $true}
+for($i=1;$i -le 3;$i++){try{Get-ChildItem -LiteralPath $p -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {try{$_.Attributes=[IO.FileAttributes]::Normal}catch{}};Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop}catch{Start-Sleep -Seconds ([math]::Min(30,5*$i))};if(-not (Test-Path -LiteralPath $p)){return $true}}
+try{& cmd.exe /c rd /s /q "$p" | Out-Null}catch{}
+ $gone=-not (Test-Path -LiteralPath $p);if(-not $gone){Write-Warn2 "cmd rd /s /q exited with code $LASTEXITCODE but '$p' still exists."}
+return $gone}
+function Find-DotNetSdk{
+ $cand=@();$local=Join-Path $Script:DotnetDir 'dotnet.exe';if(Test-Path -LiteralPath $local){$cand+=$local};$resolved=Get-Command dotnet.exe -ErrorAction SilentlyContinue;if($resolved -and ($cand -notcontains $resolved.Source)){$cand+=$resolved.Source}
+foreach($d in $cand){$prev=$ErrorActionPreference;$ErrorActionPreference='Continue';try{$null=(& $d --version 2>$null);if($LASTEXITCODE -eq 0){$sdks=@(& $d --list-sdks 2>$null);if($LASTEXITCODE -eq 0 -and (@($sdks | Where-Object {$_ -match '^8\.'}).Count -gt 0)){return $d}}}catch{}finally{$ErrorActionPreference=$prev}}
+return $null}
+function Test-SdkWorks([string]$DotNetPath){
+if([string]::IsNullOrWhiteSpace($DotNetPath) -or -not (Test-Path -LiteralPath $DotNetPath)){return $false}
+ $prev=$ErrorActionPreference;$ErrorActionPreference='Continue';try{$null=(& $DotNetPath --version 2>$null);if($LASTEXITCODE -ne 0){return $false};$sdks=@(& $DotNetPath --list-sdks 2>$null);if($LASTEXITCODE -ne 0){return $false};return (@($sdks | Where-Object {$_ -match '^8\.'}).Count -gt 0)}catch{return $false}finally{$ErrorActionPreference=$prev}}
+function Save-FileWithRetry([string]$Url,[string]$Dest){
+for($i=1;$i -le $MaxRetries;$i++){if(Test-Path -LiteralPath $Dest){Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue}
+try{if($env:HTTPS_PROXY){Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 120 -Proxy $env:HTTPS_PROXY -ErrorAction Stop}else{Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop};if((Test-Path -LiteralPath $Dest) -and ((Get-Item -LiteralPath $Dest).Length -gt 1000)){$head=((Get-Content -LiteralPath $Dest -TotalCount 5 -ErrorAction SilentlyContinue) -join ' ');if($head -notmatch '(?i)<\s*html|<!doctype'){return $true}}}catch{}
+Write-Warn2 "Download attempt $i failed for: $Url";if($i -lt $MaxRetries){Write-Warn2 "Retrying in $([math]::Min(30,5*$i)) seconds...";Start-Sleep -Seconds ([math]::Min(30,5*$i))}}
+return $false}
+function Install-DotNetSdk{
+ $Script:InstallerPath=Join-Path $env:TEMP 'dotnet-install.ps1';$urls=@('https://dot.net/v1/dotnet-install.ps1','https://raw.githubusercontent.com/dotnet/install-scripts/main/src/dotnet-install.ps1');$got=$false
+foreach($u in $urls){if(Save-FileWithRetry -Url $u -Dest $Script:InstallerPath){$got=$true;break}}
+if(-not $got){Throw-Code 2 "Could not download dotnet-install.ps1 from any known mirror after repeated retries."}
+try{Unblock-File -LiteralPath $Script:InstallerPath -ErrorAction SilentlyContinue}catch{}
+Write-Info "Installing the .NET 8 SDK user-local (no elevation) under: $($Script:DotnetDir)"
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Script:InstallerPath -Channel 8.0 -Architecture x64 -InstallDir $Script:DotnetDir
+if($LASTEXITCODE -ne 0){Throw-Code 3 "dotnet-install.ps1 exited with code $LASTEXITCODE."}}
+function Set-DotNetEnv([string]$Dir){
+if(-not (Test-Path -LiteralPath $Dir)){Throw-Code 3 "Expected dotnet directory '$Dir' does not exist after installation."}
+ $env:DOTNET_ROOT=$Dir;$env:DOTNET_MULTILEVEL_LOOKUP='0';$env:DOTNET_NOLOGO='1';$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1';$env:DOTNET_CLI_TELEMETRY_OPTOUT='1';$env:MSBUILDDISABLENODEREUSE='1';$env:NUGET_INTERACTIVE='false';if(@($env:Path -split ';') -notcontains $Dir){$env:Path="$Dir;$env:Path"}}
+function Invoke-DotNet{param([string]$ExePath,[int]$FailCode=5,[string[]]$CliArgs=@());& $ExePath @CliArgs;if($LASTEXITCODE -ne 0){Throw-Code $FailCode "dotnet $($CliArgs -join ' ') failed with exit code $LASTEXITCODE. Review the output above for the exact cause."}}
+function Test-DiskSpace([string]$Path){
+ $gb=$null;try{$di=New-Object IO.DriveInfo($Path.Substring(0,1));if($di.IsReady){$gb=[math]::Round($di.AvailableFreeSpace/1GB,2)}}catch{}
+if($null -eq $gb){Write-Warn2 'Could not determine free disk space; continuing.';return}
+ $L=$Path.Substring(0,1);if($gb -lt 0.5){Throw-Code 1 "Only $gb GB free on drive ${L}: - at least 0.5 GB is required."}elseif($gb -lt 2){Write-Warn2 "Low disk space: $gb GB free on drive ${L}:"}else{Write-Ok "Disk space OK: $gb GB free on drive ${L}:"}}
+function Write-SourceFiles([string]$Dir,[string]$Name){
+ $projCs=@'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+    <RootNamespace>__APPNAME__</RootNamespace>
+    <AssemblyName>__APPNAME__</AssemblyName>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.0.10" />
+    <PackageReference Include="Avalonia.Win32" Version="11.0.10" />
+    <PackageReference Include="Avalonia.Skia" Version="11.0.10" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.0.10" />
+    <PackageReference Include="Avalonia.Controls.DataGrid" Version="11.0.10" />
+  </ItemGroup>
+</Project>
+'@
+ $progCs=@'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Avalonia;
 
-#region --- Prerequisites ---
+namespace __APPNAME__
+{
+    internal class Program
+    {
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int MessageBox(IntPtr hWnd, string text, string caption, uint type);
 
-if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne
-    [System.Threading.ApartmentState]::STA) {
-    Write-Warning "This script requires an STA thread. Re-launch with: powershell -STA -File `"$PSCommandPath`""
-    return
-}
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
 
-if ($PSVersionTable.PSVersion.Major -lt 5) {
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        [System.Windows.Forms.MessageBox]::Show(
-            "This script requires PowerShell 5.1 or later.",
-            "Startup Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-    } catch {
-        Write-Warning "This script requires PowerShell 5.1 or later."
-    }
-    return
-}
+        [DllImport("shcore.dll")]
+        private static extern int SetProcessDpiAwareness(int awareness);
 
-if (-not [System.Environment]::Is64BitProcess) {
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        [System.Windows.Forms.MessageBox]::Show(
-            "This script requires a 64-bit PowerShell host.",
-            "Startup Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-    } catch {
-        Write-Warning "This script requires a 64-bit PowerShell host."
-    }
-    return
-}
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, Microsoft.VisualBasic
-
-#endregion
-
-#region --- XAML / Startup Diagnostic Helpers ---
-
-function Get-XamlSnippet {
-    param(
-        [string]$XamlText,
-        [int]$LineNumber,
-        [int]$Radius = 3
-    )
-    if ([string]::IsNullOrWhiteSpace($XamlText) -or $LineNumber -le 0) { return $null }
-    $lines = $XamlText -split "`r?`n"
-    if ($LineNumber -gt $lines.Count) { return $null }
-    $start = [Math]::Max(1, $LineNumber - $Radius)
-    $end   = [Math]::Min($lines.Count, $LineNumber + $Radius)
-    $sb    = New-Object System.Text.StringBuilder
-    for ($i = $start; $i -le $end; $i++) {
-        $prefix = if ($i -eq $LineNumber) { ">>" } else { "  " }
-        [void]$sb.AppendLine(("{0} {1,4}: {2}" -f $prefix, $i, $lines[$i - 1]))
-    }
-    return $sb.ToString()
-}
-
-function Get-ExceptionReport {
-    param(
-        [System.Exception]$Exception,
-        [string]$XamlText
-    )
-    $sb  = New-Object System.Text.StringBuilder
-    $idx = 0
-    $ex  = $Exception
-    while ($null -ne $ex) {
-        $label = if ($idx -eq 0) { "Exception" } else { "Inner Exception $idx" }
-        [void]$sb.AppendLine("$label Type    : $($ex.GetType().FullName)")
-        [void]$sb.AppendLine("$label Message : $($ex.Message)")
-        try {
-            $h = $ex.HResult
-            [void]$sb.AppendLine(("$label HResult : 0x{0:X8}" -f ($h -band 0xFFFFFFFF)))
-        } catch {}
-        if ($ex -is [System.Windows.Markup.XamlParseException]) {
-            if ($ex.LineNumber -gt 0 -or $ex.LinePosition -gt 0) {
-                [void]$sb.AppendLine("XAML Line      : $($ex.LineNumber)")
-                [void]$sb.AppendLine("XAML Position  : $($ex.LinePosition)")
+        // Per-monitor DPI awareness (V2), declared in code before
+        // any window exists so the app renders crisply and scales
+        // correctly on mixed-DPI multi-monitor setups instead of
+        // being bitmap-stretched by Windows. The calls fail quietly
+        // when the host already fixed an awareness level (the .NET
+        // host or a manifest can win the race); any of the three
+        // levels is better than the system-aware default.
+        private static void TrySetPerMonitorDpiAwareness()
+        {
+            try
+            {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+                if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return;
             }
-            $snippet = Get-XamlSnippet -XamlText $XamlText -LineNumber $ex.LineNumber
-            if ($snippet) {
-                [void]$sb.AppendLine("")
-                [void]$sb.AppendLine("XAML Context:")
-                [void]$sb.AppendLine($snippet)
+            catch { }
+            try
+            {
+                // PROCESS_PER_MONITOR_DPI_AWARE = 2
+                if (SetProcessDpiAwareness(2) == 0) return;
+            }
+            catch { }
+            try { SetProcessDPIAware(); } catch { }
+        }
+
+        // Entry point. Any command-line argument that names an existing file is
+        // treated as a log file to open on startup. That single mechanism is
+        // what powers both the Explorer "Open with PSTrace" context menu and
+        // dropping a file onto the PSTrace shortcut or executable icon:
+        // Windows passes the dropped or associated path as an argument.
+        // The arguments flow untouched into the Avalonia desktop lifetime and
+        // App.OnFrameworkInitializationCompleted picks the file out of them.
+        [STAThread]
+        public static void Main(string[] args)
+        {
+            TrySetPerMonitorDpiAwareness();
+            try
+            {
+                BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+            }
+            catch (Exception ex)
+            {
+                try { File.WriteAllText("crash.log", ex.ToString()); } catch { }
+                MessageBox(IntPtr.Zero, ex.ToString(), "Application Error", 0x10);
             }
         }
-        if (-not [string]::IsNullOrWhiteSpace($ex.StackTrace)) {
-            [void]$sb.AppendLine("")
-            [void]$sb.AppendLine("StackTrace:")
-            [void]$sb.AppendLine($ex.StackTrace)
+
+        public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>().UseWin32().UseSkia().LogToTrace();
+    }
+}
+'@
+ $appAxaml=@'
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="__APPNAME__.App"
+             RequestedThemeVariant="Dark">
+  <!-- Chrome brushes, dark only, taken from the Atrium client's
+       theme (src/Client/wwwroot/css/app.css in the Atrium source):
+       center-bg #18222E is the main surface, sidebar-bg
+       #1B2A3A the chrome/panel colour, the right-hand-side panel
+       #1E2938 the secondary band, the login card #21303F the raised
+       panel, the line colour rgba(255,255,255,0.08) the border
+       (composited over the surface), body text
+       rgba(255,255,255,0.92), the text-dim colour
+       rgba(255,255,255,0.56) the muted text (both composited), and
+       the accent #1C58D9. The window layout carries a lot of explicit
+       band, surface, border and text colours that the Fluent theme
+       does not reach (menu strip, filter band, details pane,
+       statistics panel), so they are defined here once and
+       referenced with DynamicResource everywhere else. Severity
+       colours are NOT here: they live in AppConfig's palette,
+       because code paints rows, chips and swatches. -->
+  <Application.Resources>
+    <ResourceDictionary>
+      <SolidColorBrush x:Key="PSTraceChromeBg" Color="#FF1B2A3A"/>
+      <SolidColorBrush x:Key="PSTraceBandBg" Color="#FF1E2938"/>
+      <SolidColorBrush x:Key="PSTracePanelBg" Color="#FF21303F"/>
+      <SolidColorBrush x:Key="PSTraceSurfaceBg" Color="#FF18222E"/>
+      <SolidColorBrush x:Key="PSTraceBorder" Color="#FF2A3644"/>
+      <SolidColorBrush x:Key="PSTraceText" Color="#FFD9DCE1"/>
+      <SolidColorBrush x:Key="PSTraceMutedText" Color="#FF9BA3AC"/>
+      <SolidColorBrush x:Key="PSTraceHeaderBg" Color="#FF21303F"/>
+      <SolidColorBrush x:Key="PSTraceHeaderText" Color="#FFECEDEF"/>
+      <SolidColorBrush x:Key="PSTraceGridLine" Color="#FF232F3C"/>
+      <SolidColorBrush x:Key="PSTraceAccent" Color="#FF1C58D9"/>
+      <SolidColorBrush x:Key="PSTraceAccentText" Color="#FF7CC4FF"/>
+      <SolidColorBrush x:Key="PSTraceErrorText" Color="#FFFF8A80"/>
+    </ResourceDictionary>
+  </Application.Resources>
+  <Application.Styles>
+    <FluentTheme />
+    <!-- Required: referencing the Avalonia.Controls.DataGrid package does
+         not merge its theme by itself. Without this include the DataGrid
+         has no control template, so it renders nothing at all (no header,
+         no rows) even though its ItemsSource is fully populated. Do not
+         remove: this was the cause of the empty-grid bug. -->
+    <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml"/>
+
+    <!-- Selection: the Fluent DataGrid theme paints the selected row
+         with a translucent accent rectangle (0078D7 at 0.6 opacity)
+         over the row background, which left severity-coloured text
+         unreadable on top of it. CMTrace uses a solid dark highlight
+         with white text instead. The selection is therefore painted
+         at every layer with the same solid dark blue: the row's own
+         Background and Foreground via the :selected style here (the
+         row template's border paints the row Background, so this is
+         the layer the template actually consumes), the theme's
+         selection rectangle via the /template/ styles below, and in
+         code (MainWindow.StyleRow), which sets the dark background
+         and white foreground as local values on the selected row so
+         the previously realised severity background cannot show
+         through. The severity signal survives selection as a
+         saturated stripe in the row's left border, set in code. -->
+    <Style Selector="DataGridRow:selected">
+      <Setter Property="Background" Value="#FF1C58D9"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+    </Style>
+    <Style Selector="DataGridRow:selected /template/ Rectangle#BackgroundRectangle">
+      <Setter Property="Fill" Value="#FF1C58D9"/>
+      <Setter Property="Opacity" Value="1"/>
+    </Style>
+    <Style Selector="DataGridRow:selected:pointerover /template/ Rectangle#BackgroundRectangle">
+      <Setter Property="Fill" Value="#FF1C58D9"/>
+      <Setter Property="Opacity" Value="1"/>
+    </Style>
+
+    <!-- Scrollbars never auto-hide: the Fluent theme fades them out
+         when the pointer is elsewhere, which reads as no scrollbar
+         at all. AllowAutoHide off keeps every bar (grid, details,
+         statistics, chip strip, dialogs) on screen whenever its
+         ScrollViewer shows one. -->
+    <Style Selector="ScrollBar">
+      <Setter Property="AllowAutoHide" Value="False"/>
+    </Style>
+
+    <!-- Cell text alignment: the TextBlock the DataGrid generates for
+         a text column carries its own 12 px horizontal margin, on top
+         of the cell padding, so cell text started 22 px into the cell
+         while the column headers start at their 10 px padding, and
+         short values in narrow columns read as centred. Zeroing the
+         generated margin leaves the cell padding as the single inset,
+         so every cell's text is left-aligned at the same offset as
+         its header, CMTrace style. -->
+    <Style Selector="DataGridCell TextBlock">
+      <Setter Property="Margin" Value="0"/>
+    </Style>
+
+    <!-- Filter chips: the Fluent theme overrides a checked
+         ToggleButton's template presenter background with the accent
+         colour, whatever the control's own Background says, which
+         painted every included chip the same blue and hid the
+         per-level colours the code sets. This style hands the
+         presenter back the chip's own Background (set in code: the
+         level palette pair when included, the muted surface pair
+         when excluded), so a filled chip reads as included and a
+         muted outlined chip as excluded. -->
+    <Style Selector="ToggleButton.chip:checked /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{TemplateBinding Background}"/>
+    </Style>
+    <!-- The same override hits the presenter Foreground: Fluent
+         forces it to white in both states, whatever the chip's own
+         Foreground is. On the dark palette's deep fills white reads
+         fine, but on the light palette's tints it is the invisible
+         chip label defect (white text on a pale fill). These styles
+         hand the presenter back the chip's own Foreground at the
+         same selector specificity, in both states. -->
+    <Style Selector="ToggleButton.chip:checked /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Foreground" Value="{TemplateBinding Foreground}"/>
+    </Style>
+    <Style Selector="ToggleButton.chip:not(:checked) /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Foreground" Value="{TemplateBinding Foreground}"/>
+    </Style>
+
+    <!-- Column headers stay in the UI font even though the grid body
+         uses the configured log font: a style setter beats the
+         inherited value the grid passes down. -->
+    <Style Selector="DataGridColumnHeader">
+      <Setter Property="FontFamily" Value="Segoe UI, Inter, DejaVu Sans, sans-serif"/>
+      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceMutedText}"/>
+      <Setter Property="Background" Value="{DynamicResource PSTraceHeaderBg}"/>
+      <Setter Property="Padding" Value="12,0,12,0"/>
+    </Style>
+    <Style Selector="DataGridCell">
+      <Setter Property="Padding" Value="12,0,12,0"/>
+    </Style>
+
+    <Style Selector="Button.pill">
+      <Setter Property="CornerRadius" Value="16"/>
+      <Setter Property="Padding" Value="16,6"/>
+    </Style>
+    <Style Selector="Border.card">
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="16"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Margin" Value="0,0,0,12"/>
+      <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource SystemControlForegroundBaseLowBrush}"/>
+    </Style>
+    <Style Selector="ToggleButton.chip">
+      <Setter Property="CornerRadius" Value="999"/>
+      <Setter Property="Padding" Value="11,4"/>
+      <Setter Property="Margin" Value="0,0,6,0"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+
+    <!-- Command-bar controls (2026 redesign): quiet ghost buttons
+         and transport toggles on the panel surface. A checked
+         transport toggle reads as active through a tinted fill and
+         an accent edge, not a solid accent block. -->
+    <Style Selector="Button.ghost">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="ToggleButton.transport">
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="BorderBrush" Value="Transparent"/>
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="ToggleButton.transport:checked">
+      <Setter Property="Background" Value="#FF24344A"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource PSTraceAccent}"/>
+    </Style>
+    <Style Selector="ToggleButton.transport:checked /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#FF24344A"/>
+    </Style>
+
+    <!-- Inset well: the search cluster sits in a well darker than
+         the surface around it, with a hairline edge and 6 px
+         corners. -->
+    <Style Selector="Border.inset">
+      <Setter Property="Background" Value="#FF141D28"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource PSTraceBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+    </Style>
+
+    <!-- Details message body well: painted with the panel brush,
+         NOT the near-black inset (Brandon, Nov 22: the details body
+         read as a black box against the themed surface). -->
+    <Style Selector="Border.detail-well">
+      <Setter Property="Background" Value="{DynamicResource PSTracePanelBg}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource PSTraceBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+    </Style>
+
+    <!-- Menu: the bar and its dropdowns wear the same palette as
+         the rest of the chrome (Brandon, Nov 22: the menu was not
+         themed like the rest of the UI). The Fluent popup panel is
+         a MenuFlyoutPresenter; painting it with the panel brush and
+         the hairline border brings the dropdowns onto the theme,
+         and the selected item gets the transport-toggle fill. -->
+    <Style Selector="Menu">
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceText}"/>
+    </Style>
+    <Style Selector="MenuItem">
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceText}"/>
+    </Style>
+    <Style Selector="MenuFlyoutPresenter">
+      <Setter Property="Background" Value="{DynamicResource PSTracePanelBg}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource PSTraceBorder}"/>
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceText}"/>
+    </Style>
+    <Style Selector="MenuItem:selected /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#FF24344A"/>
+    </Style>
+
+    <!-- Menu-strip action buttons (Next, Clear): their labels must
+         sit centred on both axes. The
+         Fluent button template honours the content alignment
+         properties, but they have to be set; the strip sets them per
+         button as well, and this style keeps any future strip button
+         honest. -->
+    <Style Selector="Button.strip-action">
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+
+    <!-- Shared text styles for window chrome and dialogs. -->
+    <Style Selector="TextBlock.section-header">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceText}"/>
+    </Style>
+    <Style Selector="TextBlock.field-label">
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceMutedText}"/>
+    </Style>
+    <Style Selector="TextBlock.field-value">
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Foreground" Value="{DynamicResource PSTraceText}"/>
+    </Style>
+  </Application.Styles>
+</Application>
+'@
+ $appCs=@'
+using System;
+using System.IO;
+using System.Linq;
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Markup.Xaml;
+using Avalonia.Styling;
+
+namespace __APPNAME__
+{
+    public partial class App : Application
+    {
+        public override void Initialize() => AvaloniaXamlLoader.Load(this);
+
+        public override void OnFrameworkInitializationCompleted()
+        {
+            // Dark only: the variant is pinned before any window
+            // exists so the first frame is already dark. There is no
+            // light theme and no toggle; a Theme key left in an old
+            // INI is ignored by AppConfig.
+            RequestedThemeVariant = ThemeVariant.Dark;
+
+            if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                var window = new MainWindow();
+                desktop.MainWindow = window;
+
+                // Feature A/C: a file path handed to the process on the
+                // command line (Explorer context menu, file association, or
+                // a file dropped onto the PSTrace icon or shortcut) is
+                // opened as soon as the window exists. The first argument
+                // that names an existing file wins, mirroring the drop
+                // policy inside the window.
+                string? initialFile = FindFileArgument(desktop.Args);
+                if (initialFile != null)
+                {
+                    window.Opened += (_, _) => window.OpenLogFile(initialFile);
+                }
+            }
+            base.OnFrameworkInitializationCompleted();
         }
-        [void]$sb.AppendLine("")
-        $ex = $ex.InnerException
-        $idx++
-    }
-    return $sb.ToString()
-}
 
-function Show-FatalError {
-    param(
-        [string]$Title = "Fatal Error",
-        [string]$Context,
-        [System.Exception]$Exception,
-        [string]$XamlText
-    )
-    $report = New-Object System.Text.StringBuilder
-    if (-not [string]::IsNullOrWhiteSpace($Context)) {
-        [void]$report.AppendLine($Context)
-        [void]$report.AppendLine("")
-    }
-    if ($null -ne $Exception) {
-        [void]$report.AppendLine((Get-ExceptionReport -Exception $Exception -XamlText $XamlText))
-    } else {
-        [void]$report.AppendLine("No exception details were available.")
-    }
-    $fullText    = $report.ToString()
-    $logPath     = Join-Path $env:TEMP "PS_CMTraceViewer_FatalError.txt"
-    try { [System.IO.File]::WriteAllText($logPath, $fullText, [System.Text.Encoding]::UTF8) } catch {}
-    $displayText = $fullText + "`r`n`r`nA copy was written to:`r`n$logPath"
-    try {
-        [System.Windows.MessageBox]::Show(
-            $displayText, $Title,
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Error) | Out-Null
-        return
-    } catch {}
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        [System.Windows.Forms.MessageBox]::Show(
-            $displayText, $Title,
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-        return
-    } catch {}
-    Write-Host $displayText -ForegroundColor Red
-}
-
-function New-XamlWindow {
-    param(
-        [Parameter(Mandatory)][string]$XamlText,
-        [string]$Context = "XAML Window"
-    )
-    $stringReader = $null
-    $xmlReader    = $null
-    try {
-        $settings               = [System.Xml.XmlReaderSettings]::new()
-        $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-        $stringReader           = [System.IO.StringReader]::new($XamlText)
-        $xmlReader              = [System.Xml.XmlReader]::Create($stringReader, $settings)
-        $window                 = [Windows.Markup.XamlReader]::Load($xmlReader)
-        if ($null -eq $window) { throw [System.Exception]::new("XamlReader.Load returned null.") }
-        return $window
-    } catch {
-        Show-FatalError -Title "$Context failed to load" `
-                        -Context "$Context could not be created." `
-                        -Exception $_.Exception `
-                        -XamlText $XamlText
-        return $null
-    } finally {
-        if ($null -ne $xmlReader)    { $xmlReader.Dispose() }
-        if ($null -ne $stringReader) { $stringReader.Dispose() }
+        internal static string? FindFileArgument(string[]? args)
+        {
+            if (args == null) return null;
+            foreach (string arg in args)
+            {
+                if (string.IsNullOrWhiteSpace(arg)) continue;
+                if (arg.StartsWith("-", StringComparison.Ordinal)) continue;
+                // A UNC argument (a network file opened from Explorer)
+                // is accepted without an existence probe: probing a
+                // dead host would stall startup for the SMB timeout.
+                // The tailer reports reachability once the window is up.
+                if (RemoteLogPath.IsUnc(arg)) return arg;
+                try
+                {
+                    if (File.Exists(arg)) return Path.GetFullPath(arg);
+                }
+                catch
+                {
+                    // A malformed path argument is ignored, never fatal.
+                }
+            }
+            return null;
+        }
     }
 }
-
-function Get-RequiredNamedControl {
-    param(
-        [Parameter(Mandatory)]$Root,
-        [Parameter(Mandatory)][string]$Name,
-        [string]$Context = "Window"
-    )
-    $obj = $Root.FindName($Name)
-    if ($null -eq $obj) {
-        throw "Required control '$Name' was not found in $Context."
-    }
-    return $obj
-}
-
-#endregion
-
-#region --- C# Type Definitions ---
-
-if (-not ("LogParser" -as [type])) {
-    Add-Type @"
+'@
+ $parserCs=@'
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
 
-public static class LogLevels {
-    public const string Error   = "Error";
-    public const string Warning = "Warn";
-    public const string Info    = "Info";
-    public const string Verbose = "Verbose";
-}
+namespace __APPNAME__
+{
+    // Ported from the C# types embedded in the original PSTrace.ps1. The
+    // parsing and severity rules are unchanged: a line is a CMTrace entry
+    // only when it starts with "<![LOG[" and contains "]LOG]!>" plus
+    // type="..." and time="..." attributes after the message; the displayed
+    // timestamp is the first 12 characters of the time value
+    // (HH:mm:ss.fff); severity is decided by the keyword list first
+    // (longest keyword match wins) and only then by the numeric type
+    // (3 = Error, 2 = Warn, 1 = Info).
 
-public static class FilterTags {
-    public const string All = "__ALL__";
-}
-
-public class KeywordItem : INotifyPropertyChanged {
-    private string _key;
-    private string _value;
-
-    public string Key {
-        get { return _key; }
-        set { if (_key != value) { _key = value; OnPropertyChanged("Key"); } }
-    }
-
-    public string Value {
-        get { return _value; }
-        set { if (_value != value) { _value = value; OnPropertyChanged("Value"); } }
-    }
-
-    public event PropertyChangedEventHandler PropertyChanged;
-    protected void OnPropertyChanged(string name) {
-        var h = PropertyChanged;
-        if (h != null) h(this, new PropertyChangedEventArgs(name));
-    }
-}
-
-public class LogEntry : INotifyPropertyChanged {
-    private string _message;
-    private string _rawMsg;
-    private string _level;
-    private string _typeVal;
-
-    public string Message {
-        get { return _message; }
-        set { if (_message != value) { _message = value; OnPropertyChanged("Message"); } }
-    }
-
-    public string RawMsg {
-        get { return _rawMsg; }
-        set { if (_rawMsg != value) { _rawMsg = value; OnPropertyChanged("RawMsg"); } }
-    }
-
-    public string Level {
-        get { return _level; }
-        set { if (_level != value) { _level = value; OnPropertyChanged("Level"); } }
-    }
-
-    public string TypeVal {
-        get { return _typeVal; }
-        set { if (_typeVal != value) { _typeVal = value; OnPropertyChanged("TypeVal"); } }
-    }
-
-    public event PropertyChangedEventHandler PropertyChanged;
-    protected void OnPropertyChanged(string name) {
-        var h = PropertyChanged;
-        if (h != null) h(this, new PropertyChangedEventArgs(name));
-    }
-}
-
-public class LevelCount {
-    public string Level      { get; set; }
-    public int    Count      { get; set; }
-    public double Percentage { get; set; }
-}
-
-public class ObservableRangeCollection<T> : ObservableCollection<T> {
-    private bool _suppressNotification = false;
-
-    public void AddRange(IEnumerable<T> collection) {
-        if (collection == null) return;
-        
-        var list = new List<T>(collection);
-        if (list.Count == 0) return;
-        
-        _suppressNotification = true;
-        try {
-            foreach (var item in list) {
-                Items.Add(item);
-            }
-        } finally {
-            _suppressNotification = false;
-        }
-        
-        OnPropertyChanged(new PropertyChangedEventArgs("Count"));
-        OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(
-            NotifyCollectionChangedAction.Reset));
-    }
-
-    public void ReplaceAll(IEnumerable<T> collection) {
-        _suppressNotification = true;
-        try {
-            Items.Clear();
-            if (collection != null) {
-                foreach (var item in collection) {
-                    Items.Add(item);
-                }
-            }
-        } finally {
-            _suppressNotification = false;
-        }
-        
-        OnPropertyChanged(new PropertyChangedEventArgs("Count"));
-        OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(
-            NotifyCollectionChangedAction.Reset));
-    }
-
-    protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e) {
-        if (!_suppressNotification) {
-            base.OnCollectionChanged(e);
-        }
-    }
-}
-
-public class SharedLogState : MarshalByRefObject {
-    public long LastFileLength;
-    public string PendingBuffer = "";
-    public bool InitialLoadComplete;
-    public bool IsFlushingInitialQueue = true;
-    public string LastError;
-    public readonly object SyncRoot = new object();
-}
-
-public static class LogParser {
-
-    private const int MaxLineLength = 1048576;
-
-    private static string DetermineLevel(
-        string rawMsg,
-        string typeVal,
-        List<KeyValuePair<string, string>> orderedKeywords)
+    public static class LogLevels
     {
-        foreach (var kw in orderedKeywords) {
-            if (rawMsg.IndexOf(kw.Key, StringComparison.OrdinalIgnoreCase) >= 0) {
-                return kw.Key;
-            }
-        }
-        if      (typeVal == "3") return LogLevels.Error;
-        else if (typeVal == "2") return LogLevels.Warning;
-        else if (typeVal == "1") return LogLevels.Info;
-        return LogLevels.Info;
+        public const string Error = "Error";
+        public const string Warning = "Warn";
+        public const string Info = "Info";
+        public const string Verbose = "Verbose";
     }
 
-    public static List<KeyValuePair<string, string>> BuildSortedKeywords(
-        Dictionary<string, string> keywords)
+    public static class FilterTags
     {
-        var list = new List<KeyValuePair<string, string>>(keywords);
-        list.Sort((a, b) => b.Key.Length.CompareTo(a.Key.Length));
-        return list;
+        public const string All = "__ALL__";
     }
 
-    public static string ReEvaluateLevel(
-        string rawMsg,
-        string typeVal,
-        List<KeyValuePair<string, string>> orderedKeywords)
+    public class KeywordItem : INotifyPropertyChanged
     {
-        return DetermineLevel(rawMsg, typeVal, orderedKeywords);
-    }
+        private string _key = "";
+        private string _value = "";
 
-    public static void ReEvaluateAll(
-        List<LogEntry> entries,
-        List<KeyValuePair<string, string>> orderedKeywords)
-    {
-        for (int i = 0; i < entries.Count; i++) {
-            entries[i].Level = DetermineLevel(
-                entries[i].RawMsg, entries[i].TypeVal, orderedKeywords);
-        }
-    }
-
-    public static List<LogEntry> FilterEntries(
-        List<LogEntry> entries,
-        Dictionary<string, bool> activeFilter)
-    {
-        var result = new List<LogEntry>(entries.Count);
-        foreach (var e in entries) {
-            bool visible;
-            if (!activeFilter.TryGetValue(e.Level, out visible)) { visible = true; }
-            if (visible) { result.Add(e); }
-        }
-        return result;
-    }
-
-    public static int FindNext(
-        IList<LogEntry> items,
-        string searchText,
-        int startIndex)
-    {
-        if (items == null || items.Count == 0 || string.IsNullOrEmpty(searchText)) return -1;
-        int count = items.Count;
-        for (int i = startIndex; i < count; i++) {
-            if (items[i] != null &&
-                items[i].Message.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0)
-                return i;
-        }
-        for (int i = 0; i < startIndex && i < count; i++) {
-            if (items[i] != null &&
-                items[i].Message.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0)
-                return i;
-        }
-        return -1;
-    }
-
-    public static List<LevelCount> GetLevelStatistics(IList<LogEntry> items) {
-        var result = new List<LevelCount>();
-        if (items == null || items.Count == 0) return result;
-        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var e in items) {
-            if (e == null || string.IsNullOrEmpty(e.Level)) continue;
-            int c;
-            if (!counts.TryGetValue(e.Level, out c)) c = 0;
-            counts[e.Level] = c + 1;
-        }
-        int total = items.Count;
-        var keys  = new List<string>(counts.Keys);
-        keys.Sort(StringComparer.OrdinalIgnoreCase);
-        foreach (var k in keys) {
-            int cnt    = counts[k];
-            double pct = (total > 0) ? (cnt * 100.0 / total) : 0.0;
-            result.Add(new LevelCount { Level = k, Count = cnt, Percentage = pct });
-        }
-        return result;
-    }
-
-    public static LogEntry ParseLine(
-        string line,
-        List<KeyValuePair<string, string>> orderedKeywords)
-    {
-        if (line == null || line.Length > MaxLineLength) return null;
-
-        if (line.StartsWith("<![LOG[", StringComparison.Ordinal) &&
-            line.Contains("]LOG]!>"))
+        public string Key
         {
-            int msgStart = 7;
-            int msgEnd   = line.IndexOf("]LOG]!>", msgStart, StringComparison.Ordinal);
-            if (msgEnd < 0) return null;
-            string rawMsg = line.Substring(msgStart, msgEnd - msgStart);
+            get => _key;
+            set { if (_key != value) { _key = value; OnPropertyChanged(nameof(Key)); } }
+        }
 
-            int typeStart = line.IndexOf("type=\"", msgEnd, StringComparison.Ordinal);
-            if (typeStart < 0) return null;
-            typeStart += 6;
-            int typeEnd = line.IndexOf("\"", typeStart, StringComparison.Ordinal);
-            if (typeEnd < 0) return null;
-            string typeVal = line.Substring(typeStart, typeEnd - typeStart);
+        public string Value
+        {
+            get => _value;
+            set { if (_value != value) { _value = value; OnPropertyChanged(nameof(Value)); } }
+        }
 
-            int timeStart = line.IndexOf("time=\"", msgEnd, StringComparison.Ordinal);
-            if (timeStart < 0) return null;
-            timeStart += 6;
-            int timeEnd = line.IndexOf("\"", timeStart, StringComparison.Ordinal);
-            if (timeEnd < 0) return null;
-            string timeStr = line.Substring(timeStart, timeEnd - timeStart);
+        public event PropertyChangedEventHandler? PropertyChanged;
+        protected void OnPropertyChanged(string name) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
 
-            string timestamp = timeStr.Length >= 12 ? "[" + timeStr.Substring(0, 12) + "]" : "[??:??:??.???]";
+    public class LogEntry : INotifyPropertyChanged
+    {
+        private string _message = "";
+        private string _rawMsg = "";
+        private string _displayText = "";
+        private string _level = "";
+        private string _typeVal = "";
+        private string _time = "";
+        private string _date = "";
+        private string _component = "";
+        private string _context = "";
+        private string _thread = "";
 
-            string level = DetermineLevel(rawMsg, typeVal, orderedKeywords);
+        public string Message
+        {
+            get => _message;
+            set { if (_message != value) { _message = value; OnPropertyChanged(nameof(Message)); } }
+        }
 
-            return new LogEntry {
-                Message = timestamp + " " + rawMsg,
-                RawMsg  = rawMsg,
-                Level   = level,
-                TypeVal = typeVal
+        public string RawMsg
+        {
+            get => _rawMsg;
+            set { if (_rawMsg != value) { _rawMsg = value; OnPropertyChanged(nameof(RawMsg)); } }
+        }
+
+        // The text the grid's Log Text column shows. For CMTrace entries
+        // and plain lines this is the same as RawMsg. For bracket-format
+        // lines ("[date time] [Level] message") it is only the message
+        // part, because the timestamp and level already have their own
+        // columns; RawMsg and Message keep the full original line, so
+        // the details pane, copy, and find see the line exactly as
+        // before.
+        public string DisplayText
+        {
+            get => _displayText;
+            set { if (_displayText != value) { _displayText = value; OnPropertyChanged(nameof(DisplayText)); } }
+        }
+
+        public string Level
+        {
+            get => _level;
+            set { if (_level != value) { _level = value; OnPropertyChanged(nameof(Level)); } }
+        }
+
+        public string TypeVal
+        {
+            get => _typeVal;
+            set { if (_typeVal != value) { _typeVal = value; OnPropertyChanged(nameof(TypeVal)); } }
+        }
+
+        // Structured CMTrace attributes, parsed from the attribute block
+        // after the message. The grid binds these as separate columns and
+        // the details pane shows them as fields; Message keeps its
+        // original "[time] text" shape for copy and compatibility.
+        // Time is the first 12 characters of the time value with no
+        // brackets. Bracket-format lines fill Date and Time from their
+        // leading "[date time]" token; other plain lines leave all of
+        // these empty.
+        public string Time
+        {
+            get => _time;
+            set { if (_time != value) { _time = value; OnPropertyChanged(nameof(Time)); } }
+        }
+
+        public string Date
+        {
+            get => _date;
+            set { if (_date != value) { _date = value; OnPropertyChanged(nameof(Date)); } }
+        }
+
+        public string Component
+        {
+            get => _component;
+            set { if (_component != value) { _component = value; OnPropertyChanged(nameof(Component)); } }
+        }
+
+        public string Context
+        {
+            get => _context;
+            set { if (_context != value) { _context = value; OnPropertyChanged(nameof(Context)); } }
+        }
+
+        public string Thread
+        {
+            get => _thread;
+            set { if (_thread != value) { _thread = value; OnPropertyChanged(nameof(Thread)); } }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        protected void OnPropertyChanged(string name) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+
+    public class LevelCount
+    {
+        public string Level { get; set; } = "";
+        public int Count { get; set; }
+        public double Percentage { get; set; }
+    }
+
+    // Bulk-add collection that raises a single Reset notification per batch,
+    // exactly like the original: without it, adding hundreds of thousands of
+    // rows one notification at a time thrashes the items control layout.
+    public class ObservableRangeCollection<T> : ObservableCollection<T>
+    {
+        private bool _suppressNotification;
+
+        public void AddRange(IEnumerable<T> collection)
+        {
+            if (collection == null) return;
+            var list = new List<T>(collection);
+            if (list.Count == 0) return;
+
+            _suppressNotification = true;
+            try
+            {
+                foreach (var item in list) Items.Add(item);
+            }
+            finally
+            {
+                _suppressNotification = false;
+            }
+
+            OnPropertyChanged(new PropertyChangedEventArgs("Count"));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(
+                NotifyCollectionChangedAction.Reset));
+        }
+
+        public void ReplaceAll(IEnumerable<T> collection)
+        {
+            _suppressNotification = true;
+            try
+            {
+                Items.Clear();
+                if (collection != null)
+                {
+                    foreach (var item in collection) Items.Add(item);
+                }
+            }
+            finally
+            {
+                _suppressNotification = false;
+            }
+
+            OnPropertyChanged(new PropertyChangedEventArgs("Count"));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(
+                NotifyCollectionChangedAction.Reset));
+        }
+
+        protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+        {
+            if (!_suppressNotification) base.OnCollectionChanged(e);
+        }
+    }
+
+    public static class LogParser
+    {
+        private const int MaxLineLength = 1048576;
+
+        private static string DetermineLevel(
+            string rawMsg,
+            string typeVal,
+            List<KeyValuePair<string, string>> orderedKeywords)
+        {
+            foreach (var kw in orderedKeywords)
+            {
+                if (rawMsg.IndexOf(kw.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return kw.Key;
+                }
+            }
+            if (typeVal == "3") return LogLevels.Error;
+            if (typeVal == "2") return LogLevels.Warning;
+            if (typeVal == "1") return LogLevels.Info;
+            return LogLevels.Info;
+        }
+
+        // Keywords are checked longest first, so a longer keyword always
+        // wins over a shorter one that is also present in the message.
+        public static List<KeyValuePair<string, string>> BuildSortedKeywords(
+            Dictionary<string, string> keywords)
+        {
+            var list = new List<KeyValuePair<string, string>>(keywords);
+            list.Sort((a, b) => b.Key.Length.CompareTo(a.Key.Length));
+            return list;
+        }
+
+        public static string ReEvaluateLevel(
+            string rawMsg,
+            string typeVal,
+            List<KeyValuePair<string, string>> orderedKeywords)
+        {
+            return DetermineLevel(rawMsg, typeVal, orderedKeywords);
+        }
+
+        public static void ReEvaluateAll(
+            List<LogEntry> entries,
+            List<KeyValuePair<string, string>> orderedKeywords)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                entries[i].Level = DetermineLevel(
+                    entries[i].RawMsg, entries[i].TypeVal, orderedKeywords);
+            }
+        }
+
+        public static List<LogEntry> FilterEntries(
+            List<LogEntry> entries,
+            Dictionary<string, bool> activeFilter)
+        {
+            var result = new List<LogEntry>(entries.Count);
+            foreach (var e in entries)
+            {
+                bool visible;
+                if (!activeFilter.TryGetValue(e.Level, out visible)) visible = true;
+                if (visible) result.Add(e);
+            }
+            return result;
+        }
+
+        public static int FindNext(
+            IList<LogEntry> items,
+            string searchText,
+            int startIndex)
+        {
+            if (items == null || items.Count == 0 || string.IsNullOrEmpty(searchText)) return -1;
+            int count = items.Count;
+            for (int i = startIndex; i < count; i++)
+            {
+                if (items[i] != null &&
+                    items[i].Message.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return i;
+            }
+            for (int i = 0; i < startIndex && i < count; i++)
+            {
+                if (items[i] != null &&
+                    items[i].Message.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return i;
+            }
+            return -1;
+        }
+
+        public static List<LevelCount> GetLevelStatistics(IList<LogEntry> items)
+        {
+            var result = new List<LevelCount>();
+            if (items == null || items.Count == 0) return result;
+            var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in items)
+            {
+                if (e == null || string.IsNullOrEmpty(e.Level)) continue;
+                int c;
+                if (!counts.TryGetValue(e.Level, out c)) c = 0;
+                counts[e.Level] = c + 1;
+            }
+            int total = items.Count;
+            var keys = new List<string>(counts.Keys);
+            keys.Sort(StringComparer.OrdinalIgnoreCase);
+            foreach (var k in keys)
+            {
+                int cnt = counts[k];
+                double pct = (total > 0) ? (cnt * 100.0 / total) : 0.0;
+                result.Add(new LevelCount { Level = k, Count = cnt, Percentage = pct });
+            }
+            return result;
+        }
+
+        // Reads one name="value" attribute from the attribute block at
+        // or after startIndex. Returns "" when the attribute is absent
+        // or malformed: unlike type and time, the structured fields are
+        // optional, so a missing one never drops the entry.
+        private static string ExtractAttribute(string line, int startIndex, string name)
+        {
+            string key = name + "=\"";
+            int s = line.IndexOf(key, startIndex, StringComparison.Ordinal);
+            if (s < 0) return "";
+            s += key.Length;
+            int e = line.IndexOf("\"", s, StringComparison.Ordinal);
+            if (e < 0) return "";
+            return line.Substring(s, e - s);
+        }
+
+        public static LogEntry? ParseLine(
+            string line,
+            List<KeyValuePair<string, string>> orderedKeywords)
+        {
+            if (line == null || line.Length > MaxLineLength) return null;
+
+            if (line.StartsWith("<![LOG[", StringComparison.Ordinal) &&
+                line.Contains("]LOG]!>"))
+            {
+                int msgStart = 7;
+                int msgEnd = line.IndexOf("]LOG]!>", msgStart, StringComparison.Ordinal);
+                if (msgEnd < 0) return null;
+                string rawMsg = line.Substring(msgStart, msgEnd - msgStart);
+
+                int typeStart = line.IndexOf("type=\"", msgEnd, StringComparison.Ordinal);
+                if (typeStart < 0) return null;
+                typeStart += 6;
+                int typeEnd = line.IndexOf("\"", typeStart, StringComparison.Ordinal);
+                if (typeEnd < 0) return null;
+                string typeVal = line.Substring(typeStart, typeEnd - typeStart);
+
+                int timeStart = line.IndexOf("time=\"", msgEnd, StringComparison.Ordinal);
+                if (timeStart < 0) return null;
+                timeStart += 6;
+                int timeEnd = line.IndexOf("\"", timeStart, StringComparison.Ordinal);
+                if (timeEnd < 0) return null;
+                string timeStr = line.Substring(timeStart, timeEnd - timeStart);
+
+                string timestamp = timeStr.Length >= 12 ? "[" + timeStr.Substring(0, 12) + "]" : "[??:??:??.???]";
+
+                string level = DetermineLevel(rawMsg, typeVal, orderedKeywords);
+
+                return new LogEntry
+                {
+                    Message = timestamp + " " + rawMsg,
+                    RawMsg = rawMsg,
+                    DisplayText = rawMsg,
+                    Level = level,
+                    TypeVal = typeVal,
+                    Time = timeStr.Length >= 12 ? timeStr.Substring(0, 12) : "??:??:??.???",
+                    Date = ExtractAttribute(line, msgEnd, "date"),
+                    Component = ExtractAttribute(line, msgEnd, "component"),
+                    Context = ExtractAttribute(line, msgEnd, "context"),
+                    Thread = ExtractAttribute(line, msgEnd, "thread")
+                };
+            }
+            else
+            {
+                // Severity is decided on the whole line, exactly as
+                // before, so a bracket line's level still comes from
+                // its "[Level]" token and message keywords combined.
+                string level = DetermineLevel(line, "0", orderedKeywords);
+                var entry = new LogEntry
+                {
+                    Message = line,
+                    RawMsg = line,
+                    DisplayText = line,
+                    Level = level,
+                    TypeVal = "0"
+                };
+                if (TryParseBracketPrefix(line, out string date, out string time, out string message))
+                {
+                    entry.Date = date;
+                    entry.Time = time;
+                    entry.DisplayText = message;
+                }
+                return entry;
+            }
+        }
+
+        // Bracket-format lines, written by tools that prefix each line
+        // with a timestamp and a level in square brackets:
+        // "[2025-10-05 19:53:37] [Info] message text". When the leading
+        // token is a real date and time, the entry gains Date and Time
+        // fields (kept in the source's own shape: yyyy-MM-dd and
+        // HH:mm:ss with optional fractional seconds) and the display
+        // text becomes the message after the level token. A leading
+        // bracket that is not a valid timestamp leaves the line a
+        // plain entry, untouched.
+        private static bool TryParseBracketPrefix(
+            string line,
+            out string date,
+            out string time,
+            out string message)
+        {
+            date = "";
+            time = "";
+            message = "";
+            if (line.Length < 3 || line[0] != '[') return false;
+            int close = line.IndexOf(']');
+            if (close < 0) return false;
+            string token = line.Substring(1, close - 1);
+            int space = token.IndexOf(' ');
+            if (space <= 0) return false;
+            string datePart = token.Substring(0, space);
+            string timePart = token.Substring(space + 1);
+            if (!DateTime.TryParseExact(
+                    token,
+                    new[] { "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm:ss.FFFFFFF" },
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None,
+                    out _))
+            {
+                return false;
+            }
+
+            int pos = close + 1;
+            while (pos < line.Length && line[pos] == ' ') pos++;
+            // Optional "[Level]" token: the display text is what
+            // follows it. Without one, the display text is what
+            // follows the timestamp token.
+            if (pos < line.Length && line[pos] == '[')
+            {
+                int levelClose = line.IndexOf(']', pos);
+                if (levelClose > pos + 1)
+                {
+                    int after = levelClose + 1;
+                    while (after < line.Length && line[after] == ' ') after++;
+                    message = after < line.Length ? line.Substring(after) : "";
+                    date = datePart;
+                    time = timePart;
+                    return true;
+                }
+            }
+            message = pos < line.Length ? line.Substring(pos) : "";
+            date = datePart;
+            time = timePart;
+            return true;
+        }
+    }
+}
+'@
+ $tailerCs=@'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+namespace __APPNAME__
+{
+    // Background file tailer. This mirrors the runspace script in the
+    // original PSTrace.ps1: poll the file length, read only the new bytes
+    // with FileShare.ReadWrite so a log being written by another process is
+    // never locked, assemble multi-line CMTrace entries (an entry starts at
+    // a "<![LOG[" line and continuation lines are appended), hold a trailing
+    // incomplete CMTrace entry back as pending until its "]LOG]!>"
+    // terminator arrives, reset cleanly when the file shrinks (rotation or
+    // truncation), and back off exponentially on IO errors.
+    public sealed class LogTailer : IDisposable
+    {
+        private readonly string _filePath;
+        private readonly List<KeyValuePair<string, string>> _orderedKeywords;
+        private readonly int _pollIntervalMs;
+        private readonly ConcurrentQueue<LogEntry> _queue = new ConcurrentQueue<LogEntry>();
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+        private Thread? _thread;
+
+        private long _lastFileLength;
+        private string _pendingBuffer = "";
+        private bool _fileSeen;
+        private DateTime _runStartedUtc;
+
+        public LogTailer(string filePath, List<KeyValuePair<string, string>> orderedKeywords, int pollIntervalMs = 500)
+        {
+            _filePath = filePath;
+            _orderedKeywords = orderedKeywords;
+            _pollIntervalMs = pollIntervalMs;
+        }
+
+        public ConcurrentQueue<LogEntry> Queue => _queue;
+        public bool InitialLoadComplete { get; private set; }
+        public string? LastError { get; private set; }
+        public string FilePath => _filePath;
+
+        public void Start()
+        {
+            _thread = new Thread(Run) { IsBackground = true, Name = "PSTrace.LogTailer" };
+            _thread.Start();
+        }
+
+        public void Dispose()
+        {
+            try { _cts.Cancel(); } catch { }
+            try { _thread?.Join(2000); } catch { }
+            _cts.Dispose();
+        }
+
+        private void Run()
+        {
+            var token = _cts.Token;
+            var buffer = new StringBuilder();
+            int consecutiveErrors = 0;
+            const int maxBackoffMs = 30000;
+            _runStartedUtc = DateTime.UtcNow;
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    var fileInfo = new FileInfo(_filePath);
+                    fileInfo.Refresh();
+
+                    if (!fileInfo.Exists)
+                    {
+                        // The file has never been seen and a few seconds
+                        // have passed: say so, once, instead of waiting
+                        // silently forever. This is the failure shape of
+                        // a remote open (\\computer\share\file.log) whose
+                        // host is off, whose share name is wrong, or
+                        // whose permissions deny access: over SMB all of
+                        // them look like "not there" from here. Note the
+                        // probe itself can block for the Windows SMB
+                        // timeout on a dead host before this is set; the
+                        // wait happens on this background thread, never
+                        // on the UI thread.
+                        if (!_fileSeen && LastError == null &&
+                            (DateTime.UtcNow - _runStartedUtc).TotalSeconds > 3)
+                        {
+                            LastError = $"Cannot reach '{_filePath}': file not found. " +
+                                "For a remote path, check the computer name, the share, and your permissions.";
+                        }
+                        token.WaitHandle.WaitOne(_pollIntervalMs);
+                        continue;
+                    }
+
+                    if (!_fileSeen)
+                    {
+                        // First sight of the file: any "cannot reach"
+                        // message from the wait above is now stale.
+                        _fileSeen = true;
+                        LastError = null;
+                    }
+
+                    long currentLength = fileInfo.Length;
+
+                    if (currentLength < _lastFileLength)
+                    {
+                        // File was truncated or rotated: start over.
+                        _lastFileLength = 0;
+                        _pendingBuffer = "";
+                        buffer.Clear();
+                    }
+
+                    if (currentLength > _lastFileLength)
+                    {
+                        using (var stream = new FileStream(
+                            _filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (var reader = new StreamReader(stream, Encoding.UTF8, true, 65536))
+                        {
+                            stream.Seek(_lastFileLength, SeekOrigin.Begin);
+                            _lastFileLength = currentLength;
+
+                            buffer.Clear();
+                            if (_pendingBuffer.Length > 0)
+                            {
+                                buffer.Append(_pendingBuffer);
+                                _pendingBuffer = "";
+                            }
+
+                            string? line;
+                            while ((line = reader.ReadLine()) != null)
+                            {
+                                if (line.StartsWith("<![LOG[", StringComparison.Ordinal) && buffer.Length > 0)
+                                {
+                                    var entry = LogParser.ParseLine(buffer.ToString(), _orderedKeywords);
+                                    if (entry != null) _queue.Enqueue(entry);
+                                    buffer.Clear();
+                                    buffer.Append(line);
+                                }
+                                else if (line.StartsWith("<![LOG[", StringComparison.Ordinal))
+                                {
+                                    buffer.Clear();
+                                    buffer.Append(line);
+                                }
+                                else if (buffer.Length > 0)
+                                {
+                                    buffer.AppendLine(line);
+                                }
+                                else
+                                {
+                                    var entry = LogParser.ParseLine(line, _orderedKeywords);
+                                    if (entry != null) _queue.Enqueue(entry);
+                                }
+                            }
+
+                            if (buffer.Length > 0)
+                            {
+                                string bufferStr = buffer.ToString();
+                                if (bufferStr.StartsWith("<![LOG[", StringComparison.Ordinal) &&
+                                    !bufferStr.Contains("]LOG]!>"))
+                                {
+                                    // Trailing partial CMTrace entry: hold it
+                                    // until the rest of it is written.
+                                    _pendingBuffer = bufferStr;
+                                }
+                                else
+                                {
+                                    var entry = LogParser.ParseLine(bufferStr, _orderedKeywords);
+                                    if (entry != null) _queue.Enqueue(entry);
+                                    _pendingBuffer = "";
+                                }
+                            }
+                        }
+
+                        if (!InitialLoadComplete) InitialLoadComplete = true;
+                        consecutiveErrors = 0;
+                        // A successful read clears any earlier error so
+                        // the status bar stops showing a stale problem.
+                        LastError = null;
+                    }
+                }
+                catch (IOException ex)
+                {
+                    consecutiveErrors++;
+                    LastError = $"IO error ({consecutiveErrors}) at {DateTime.Now:HH:mm:ss} on '{_filePath}': {ex.Message}";
+                    int backoffMs = (int)Math.Min(_pollIntervalMs * Math.Pow(2, consecutiveErrors), maxBackoffMs);
+                    if (token.WaitHandle.WaitOne(backoffMs)) break;
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    consecutiveErrors++;
+                    LastError = $"Unexpected error ({consecutiveErrors}) at {DateTime.Now:HH:mm:ss}: {ex.Message}";
+                    int backoffMs = (int)Math.Min(_pollIntervalMs * Math.Pow(2, consecutiveErrors), maxBackoffMs);
+                    if (token.WaitHandle.WaitOne(backoffMs)) break;
+                    continue;
+                }
+
+                if (token.WaitHandle.WaitOne(_pollIntervalMs)) break;
+            }
+        }
+    }
+}
+'@
+ $configCs=@'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text.Json;
+
+namespace __APPNAME__
+{
+    // Settings persisted to an INI file in AppData, the same file name and
+    // the same keys the original PSTrace.ps1 used (%APPDATA%\
+    // PS_CMTraceViewer.ini), so existing preferences carry over to this
+    // build. Sections: [Settings] for scalars, [Keywords] for the
+    // keyword-to-colour-name map.
+    public sealed class AppConfig
+    {
+        public string FontFamily { get; set; } = "Consolas";
+        public double FontSize { get; set; } = 12;
+        public double BottomPanelHeight { get; set; } = 150;
+        public bool FormatJson { get; set; } = true;
+        public bool SplitComma { get; set; } = true;
+        public bool SplitSpace { get; set; } = false;
+        public bool SplitPeriod { get; set; } = false;
+        public List<string> CustomDelimiters { get; set; } = new List<string>();
+        public int UpdateSpeed { get; set; } = 3;
+        // Whole-interface scale factor (Settings slider, 75% to
+        // 150%), applied as a layout transform on every window so
+        // the app stays usable on high-DPI and low-vision setups.
+        public double UiScale { get; set; } = 1.0;
+        // The neutral log text colour (Settings picker). It paints
+        // the rows whose keyword colour is White (the Info bulk of
+        // every log) and the details body. Severity rows keep their
+        // per-level tints: the Type column and stripe carry those.
+        public string TextColorName { get; set; } = "Dim White";
+
+        public static readonly Dictionary<string, string> TextColorPresets =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["White"] = "#FFE8E8E8",
+                ["Dim White"] = "#FFCCD0D6",
+                ["Grey"] = "#FFAEB4BC",
+                ["Blue Grey"] = "#FFA9B7C6",
+                ["Sky Blue"] = "#FF9FC3E8",
+                ["Pale Cyan"] = "#FFA8D8D0",
+                ["Soft Green"] = "#FFACC7B0",
+                ["Mint"] = "#FFBFE3C6",
+                ["Sand"] = "#FFD8C39A",
+                ["Peach"] = "#FFE8BFA8",
+                ["Lavender"] = "#FFC3B2E0",
+                ["Pink"] = "#FFE3A8BC",
+            };
+
+        // The keyword colour names as a static array, so XAML can
+        // bind a ComboBox ItemsSource with x:Static: the list is
+        // populated before any row binding evaluates, which keeps
+        // the Settings grid's colour cells from realising blank.
+        public static string[] ColorNameList =>
+            new System.Collections.Generic.List<string>(DarkColorMap.Keys).ToArray();
+
+        // A stored colour name that is not in the dark palette
+        // (written by an older build) falls back to White rather
+        // than leaving a colour cell blank.
+        public static string NormalizeColorName(string? name)
+        {
+            if (name != null)
+            {
+                foreach (string key in DarkColorMap.Keys)
+                {
+                    if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return key;
+                }
+            }
+            return "White";
+        }
+
+        public string TextColorHex() =>
+            TextColorPresets.TryGetValue(TextColorName, out var hex) ? hex : TextColorPresets["Dim White"];
+        public string LastLogFile { get; set; } = "";
+        public double WindowWidth { get; set; } = 1200;
+        public double WindowHeight { get; set; } = 700;
+        public string StatsSortColumn { get; set; } = "Count";
+        public string StatsSortDirection { get; set; } = "Ascending";
+        // The app is dark only (Brandon's direction, round 2): there
+        // is no theme setting any more. A Theme key left in an older
+        // INI by the toggle build is ignored on load and dropped on
+        // the next save.
+        public Dictionary<string, string> Keywords { get; set; } = DefaultKeywords();
+
+        public static string ConfigPath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PS_CMTraceViewer.ini");
+
+        // Brandon's keyword set and colours, identical to the defaults in
+        // the original viewer. Severity checks run longest keyword first;
+        // the colour named here is looked up in the dark palette maps.
+        public static Dictionary<string, string> DefaultKeywords()
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Critical"] = "Red",
+                ["Error"] = "Red",
+                ["Exception"] = "Red",
+                ["Failed"] = "Red",
+                ["Warn"] = "Orange",
+                ["Success"] = "Green",
+                ["Verbose"] = "Blue",
+                ["Info"] = "White",
             };
         }
-        else {
-            string level = DetermineLevel(line, "0", orderedKeywords);
-            return new LogEntry {
-                Message = line,
-                RawMsg  = line,
-                Level   = level,
-                TypeVal = "0"
+
+        // Severity palette, dark only. The original's pastels washed
+        // out (pale fills with mid-tone text, roughly 2:1 contrast,
+        // and one chip label effectively invisible), so the palette
+        // is built to a rule: every foreground / background pair
+        // measures at least 4.5:1 contrast, verified by the view
+        // tests against the Atrium-themed surfaces. The colour
+        // associations are unchanged (red family for the failure
+        // levels, orange and yellow for Warn, green for Success,
+        // blue for Verbose, neutral for Info).
+        //
+        // 2026 redesign: full saturated row fills are gone. A row
+        // background is now a quiet tint of the level hue over the
+        // surface (Info is the bare surface), the row text is a pale
+        // tint of the same hue, and the saturated signal lives in
+        // the left stripe and the Type column. Severity is never
+        // carried by hue alone: the Type column names the level in
+        // text on every row.
+        public static readonly Dictionary<string, string> DarkColorMap =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Red"] = "#FF3A2429",
+                ["Orange"] = "#FF3A2E20",
+                ["Yellow"] = "#FF37331F",
+                ["Green"] = "#FF223128",
+                ["Blue"] = "#FF22303F",
+                ["Purple"] = "#FF2E2638",
+                ["White"] = "#FF18222E",
             };
-        }
-    }
-}
-"@
-}
 
-#endregion
+        public static readonly Dictionary<string, string> DarkTextColorMap =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Red"] = "#FFFFB4B0",
+                ["Orange"] = "#FFFFCF99",
+                ["Yellow"] = "#FFF7E29A",
+                ["Green"] = "#FFA9DDB2",
+                ["Blue"] = "#FFA9CCEF",
+                ["Purple"] = "#FFDDBEF2",
+                ["White"] = "#FFCCD0D6",
+            };
 
-#region --- Named Constants ---
+        // Selection stripes: the saturated colour that survives in a
+        // selected row's left border. Bright tones, chosen to stay
+        // visible against the dark selection highlight.
+        public static readonly Dictionary<string, string> DarkStripeColorMap =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Red"] = "#FFEF5350",
+                ["Orange"] = "#FFFFA726",
+                ["Yellow"] = "#FFF9A825",
+                ["Green"] = "#FF66BB6A",
+                ["Blue"] = "#FF42A5F5",
+                ["Purple"] = "#FFCE93D8",
+                ["White"] = "#FF90A4AE",
+            };
 
-$script:MaxDrainPerTick     = 10000
-$script:PollIntervalMs      = 500
-$script:InitialCapacity     = 500000
-$script:FastTimerIntervalMs = 50
-$script:MaxRetainedEntries  = 10000000
-$script:TrimThreshold       = [int]($script:MaxRetainedEntries * 1.1)
-$script:MinFontSize         = 6
-$script:MaxFontSize         = 72
-$script:MinUpdateSpeed      = 1
-$script:MaxUpdateSpeed      = 60
-$script:MinWindowWidth      = 400
-$script:MaxWindowWidth      = 7680
-$script:MinWindowHeight     = 300
-$script:MaxWindowHeight     = 4320
-$script:SearchPausedSuffix  = " [Searching - tailing paused]"
-$script:MaxKeywordCount     = 100
-$script:RunspaceShutdownMs  = 2000
-$script:MaxErrorLogEntries  = 500
-$script:JsonFormatDepth     = 50
-$script:MaxIniLineLength    = 4096
-$script:MaxJsonFormatLength = 100000
+        public static Dictionary<string, string> RowBackgrounds() => DarkColorMap;
 
-$script:SortColumns    = @("Type", "Count", "Percentage")
-$script:SortDirections = @("Ascending", "Descending")
+        public static Dictionary<string, string> RowForegrounds() => DarkTextColorMap;
 
-#endregion
+        public static Dictionary<string, string> Stripes() => DarkStripeColorMap;
 
-#region --- Operational Error Log ---
+        public List<KeyValuePair<string, string>> BuildOrderedKeywords() =>
+            LogParser.BuildSortedKeywords(new Dictionary<string, string>(Keywords));
 
-$script:ErrorLog = New-Object System.Collections.Generic.List[string]
+        public static AppConfig Load()
+        {
+            var cfg = new AppConfig();
+            string path = ConfigPath;
+            if (!File.Exists(path)) return cfg;
 
-function Write-OperationalError {
-    param(
-        [string]$Context,
-        [string]$Message
-    )
-    $entry  = "[$(Get-Date -Format 'HH:mm:ss')] $Context : $Message"
-    $script:ErrorLog.Add($entry)
-    $excess = $script:ErrorLog.Count - $script:MaxErrorLogEntries
-    if ($excess -gt 0) { $script:ErrorLog.RemoveRange(0, $excess) }
-}
+            string section = "";
+            try
+            {
+                foreach (string rawLine in File.ReadAllLines(path))
+                {
+                    string line = rawLine.Trim();
+                    if (line.Length == 0 || line.StartsWith(";") || line.StartsWith("#")) continue;
+                    if (line.StartsWith("[") && line.EndsWith("]"))
+                    {
+                        section = line.Substring(1, line.Length - 2).Trim();
+                        continue;
+                    }
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string key = line.Substring(0, eq).Trim();
+                    string value = line.Substring(eq + 1).Trim();
 
-function Report-Error {
-    param(
-        [string]$Context,
-        [string]$Message,
-        [switch]$ShowDialog,
-        [System.Windows.MessageBoxImage]$Icon = [System.Windows.MessageBoxImage]::Warning
-    )
-    Write-OperationalError -Context $Context -Message $Message
-    if ($ShowDialog) {
-        try {
-            [System.Windows.MessageBox]::Show(
-                $Message, $Context,
-                [System.Windows.MessageBoxButton]::OK,
-                $Icon) | Out-Null
-        } catch {
-            Write-OperationalError "Report-Error" "Could not show dialog: $_"
-        }
-    }
-}
+                    if (section.Equals("Keywords", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (DarkColorMap.ContainsKey(value)) cfg.Keywords[key] = value;
+                        continue;
+                    }
 
-#endregion
-
-#region --- Colour Map ---
-
-$script:ColorMap = @{
-    "Red"    = "#FFFFCDD2"
-    "Orange" = "#FFFFE0B2"
-    "Yellow" = "#FFFFF9C4"
-    "Green"  = "#FFC8E6C9"
-    "Blue"   = "#FFE1F5FE"
-    "Purple" = "#FFE1BEE7"
-    "White"  = "#FFFFFFFF"
-}
-
-$script:TextColorMap = @{
-    "Red"    = "#FFD32F2F"
-    "Orange" = "#FFF57C00"
-    "Yellow" = "#FFF9A825"
-    "Green"  = "#FF388E3C"
-    "Blue"   = "#FF1976D2"
-    "Purple" = "#FF7B1FA2"
-    "White"  = "#FF424242"
-}
-
-$script:ReverseColorMap = @{}
-foreach ($k in $script:ColorMap.Keys) {
-    $script:ReverseColorMap[$script:ColorMap[$k]] = $k
-}
-
-#endregion
-
-#region --- Utility Helpers ---
-
-function Find-ScrollViewer {
-    param($Root)
-    if ($null -eq $Root) { return $null }
-    $queue = New-Object System.Collections.Generic.Queue[object]
-    $queue.Enqueue($Root)
-    while ($queue.Count -gt 0) {
-        $node = $queue.Dequeue()
-        if ($node -is [System.Windows.Controls.ScrollViewer]) { return $node }
-        if ($node -isnot [System.Windows.Media.Visual]) { continue }
-        $childCount = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($node)
-        for ($i = 0; $i -lt $childCount; $i++) {
-            $child = [System.Windows.Media.VisualTreeHelper]::GetChild($node, $i)
-            if ($child -is [System.Windows.Media.Visual]) { $queue.Enqueue($child) }
-        }
-    }
-    return $null
-}
-
-function Add-SlowScroll {
-    param($UIElement)
-    if ($null -eq $UIElement) { return }
-    $UIElement.Add_PreviewMouseWheel({
-        param($sender, $e)
-        $scroller = Find-ScrollViewer $sender
-        if ($null -ne $scroller) {
-            $scroller.ScrollToVerticalOffset($scroller.VerticalOffset - ($e.Delta / 4))
-            $e.Handled = $true
-        }
-    })
-}
-
-function Set-TimerInterval {
-    param([TimeSpan]$Interval)
-    $sb = {
-        param($iv)
-        $script:RefreshTimer.Stop()
-        $script:RefreshTimer.Interval = $iv
-        $script:RefreshTimer.Start()
-    }
-    if ($null -ne $script:MainWindow -and -not $script:MainWindow.Dispatcher.CheckAccess()) {
-        $script:MainWindow.Dispatcher.Invoke($sb, $Interval)
-    } else {
-        & $sb $Interval
-    }
-}
-
-function Get-SortedKeywords {
-    $dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
-    foreach ($kv in $script:Config.Keywords.GetEnumerator()) {
-        $dict[$kv.Key] = $kv.Value
-    }
-    return [LogParser]::BuildSortedKeywords($dict)
-}
-
-function Copy-ToClipboard {
-    param([string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return }
-    $retries = 3
-    for ($i = 0; $i -lt $retries; $i++) {
-        try {
-            [System.Windows.Clipboard]::SetText($Text)
-            return
-        } catch [System.Runtime.InteropServices.ExternalException] {
-            if ($i -eq $retries - 1) {
-                Report-Error "Copy-ToClipboard" "Failed after $retries attempts: $_"
-            } else {
-                Start-Sleep -Milliseconds 100
-            }
-        } catch {
-            Report-Error "Copy-ToClipboard" "Unexpected clipboard error: $_"
-            return
-        }
-    }
-}
-
-$script:BrushCache = New-Object 'System.Collections.Generic.Dictionary[string,System.Windows.Media.SolidColorBrush]'
-
-function Get-CachedBrush {
-    param([string]$Hex)
-    $brush = $null
-    if (-not $script:BrushCache.TryGetValue($Hex, [ref]$brush)) {
-        try {
-            $brush = New-Object System.Windows.Media.SolidColorBrush(
-                [System.Windows.Media.ColorConverter]::ConvertFromString($Hex))
-            $brush.Freeze()
-            $script:BrushCache[$Hex] = $brush
-        } catch {
-            Report-Error "Get-CachedBrush" "Cannot create brush for '$Hex': $_"
-            $brush = [System.Windows.Media.Brushes]::White
-        }
-    }
-    return $brush
-}
-
-function Clear-BrushCache {
-    $script:BrushCache.Clear()
-}
-
-function Test-ColorMapKey {
-    param([string]$Key)
-    return $script:ColorMap.ContainsKey($Key)
-}
-
-function Test-TextColorMapKey {
-    param([string]$Key)
-    return $script:TextColorMap.ContainsKey($Key)
-}
-
-#endregion
-
-#region --- Configuration & INI Management ---
-
-$script:ConfigPath = "$env:APPDATA\PS_CMTraceViewer.ini"
-
-function Get-DefaultConfig {
-    return @{
-        FontFamily         = "Consolas"
-        FontSize           = 12
-        BottomPanelHeight  = 250
-        FormatJson         = $true
-        SplitComma         = $true
-        SplitSpace         = $false
-        SplitPeriod        = $false
-        CustomDelimiters   = @()
-        UpdateSpeed        = 3
-        LastLogFile        = ""
-        WindowWidth        = 1200
-        WindowHeight       = 700
-        StatsSortColumn    = "Count"
-        StatsSortDirection = "Ascending"
-        Keywords           = @{
-            "Critical"  = "Red"
-            "Error"     = "Red"
-            "Exception" = "Red"
-            "Failed"    = "Red"
-            "Warn"      = "Orange"
-            "Success"   = "Green"
-            "Verbose"   = "Blue"
-            "Info"      = "White"
-        }
-    }
-}
-
-$script:Config = Get-DefaultConfig
-
-function Import-Config {
-    if (-not (Test-Path $script:ConfigPath)) { return }
-    $defaults = Get-DefaultConfig
-    $section  = ""
-    $kw       = @{}
-    $delims   = @()
-    $settings = @{
-        FontFamily         = $defaults.FontFamily
-        FontSize           = $defaults.FontSize
-        BottomPanelHeight  = $defaults.BottomPanelHeight
-        FormatJson         = $defaults.FormatJson
-        SplitComma         = $defaults.SplitComma
-        SplitSpace         = $defaults.SplitSpace
-        SplitPeriod        = $defaults.SplitPeriod
-        UpdateSpeed        = $defaults.UpdateSpeed
-        LastLogFile        = ""
-        WindowWidth        = $defaults.WindowWidth
-        WindowHeight       = $defaults.WindowHeight
-        StatsSortColumn    = $defaults.StatsSortColumn
-        StatsSortDirection = $defaults.StatsSortDirection
-    }
-
-    foreach ($line in [System.IO.File]::ReadLines($script:ConfigPath, [System.Text.Encoding]::UTF8)) {
-        if ($line.Length -gt $script:MaxIniLineLength) { continue }
-        $trimLine = $line.Trim()
-        if ([string]::IsNullOrWhiteSpace($trimLine)) { continue }
-
-        if ($trimLine -match '^\[(.+)\]$') {
-            $section = $matches[1]
-            continue
-        }
-
-        $eqIndex = $trimLine.IndexOf('=')
-        if ($eqIndex -lt 0) { continue }
-        $key = $trimLine.Substring(0, $eqIndex).Trim()
-        if ([string]::IsNullOrWhiteSpace($key)) { continue }
-        $val = $trimLine.Substring($eqIndex + 1).Trim()
-
-        if ($section -eq "Settings") {
-            if ($settings.ContainsKey($key)) { $settings[$key] = $val }
-        } elseif ($section -eq "Keywords") {
-            if ($script:ReverseColorMap.ContainsKey($val)) {
-                $val = $script:ReverseColorMap[$val]
-            }
-            if (-not (Test-ColorMapKey $val)) {
-                Report-Error "Import-Config" "Unknown colour '$val' for keyword '$key' - defaulting to White."
-                $val = "White"
-            }
-            if (-not [string]::IsNullOrWhiteSpace($key)) {
-                if ($kw.Count -lt $script:MaxKeywordCount) {
-                    $kw[$key] = $val
-                } else {
-                    Report-Error "Import-Config" "Keyword limit ($($script:MaxKeywordCount)) reached - '$key' ignored."
-                }
-            }
-        } elseif ($section -eq "Delimiters") {
-            if (-not [string]::IsNullOrWhiteSpace($val)) { $delims += $val }
-        }
-    }
-
-    $script:Config.FontFamily = if ($settings.ContainsKey("FontFamily") -and -not [string]::IsNullOrWhiteSpace($settings["FontFamily"])) {
-        $settings["FontFamily"]
-    } else { $defaults.FontFamily }
-
-    try {
-        $script:Config.FontSize = [Math]::Max($script:MinFontSize, [Math]::Min($script:MaxFontSize, [int]$settings["FontSize"]))
-    } catch { $script:Config.FontSize = $defaults.FontSize }
-
-    try {
-        $script:Config.BottomPanelHeight = [Math]::Max(80, [int]$settings["BottomPanelHeight"])
-    } catch { $script:Config.BottomPanelHeight = $defaults.BottomPanelHeight }
-
-    $script:Config.FormatJson  = ($settings["FormatJson"]  -eq "True")
-    $script:Config.SplitComma  = ($settings["SplitComma"]  -eq "True")
-    $script:Config.SplitSpace  = ($settings["SplitSpace"]  -eq "True")
-    $script:Config.SplitPeriod = ($settings["SplitPeriod"] -eq "True")
-
-    try {
-        $script:Config.UpdateSpeed = [Math]::Max($script:MinUpdateSpeed, [Math]::Min($script:MaxUpdateSpeed, [int]$settings["UpdateSpeed"]))
-    } catch { $script:Config.UpdateSpeed = $defaults.UpdateSpeed }
-
-    $script:Config.LastLogFile = if ($settings.ContainsKey("LastLogFile") -and -not [string]::IsNullOrWhiteSpace($settings["LastLogFile"])) {
-        $settings["LastLogFile"]
-    } else { "" }
-
-    try {
-        $script:Config.WindowWidth = [Math]::Max($script:MinWindowWidth, [Math]::Min($script:MaxWindowWidth, [int]$settings["WindowWidth"]))
-    } catch { $script:Config.WindowWidth = $defaults.WindowWidth }
-
-    try {
-        $script:Config.WindowHeight = [Math]::Max($script:MinWindowHeight, [Math]::Min($script:MaxWindowHeight, [int]$settings["WindowHeight"]))
-    } catch { $script:Config.WindowHeight = $defaults.WindowHeight }
-
-    $script:Config.StatsSortColumn = if ($settings.ContainsKey("StatsSortColumn") -and $script:SortColumns -contains $settings["StatsSortColumn"]) {
-        $settings["StatsSortColumn"]
-    } else { $defaults.StatsSortColumn }
-
-    $script:Config.StatsSortDirection = if ($settings.ContainsKey("StatsSortDirection") -and $script:SortDirections -contains $settings["StatsSortDirection"]) {
-        $settings["StatsSortDirection"]
-    } else { $defaults.StatsSortDirection }
-
-    if ($kw.Count     -gt 0) { $script:Config.Keywords         = $kw }
-    if ($delims.Count -gt 0) { $script:Config.CustomDelimiters = $delims }
-}
-
-function Export-Config {
-    try {
-        $safeFontFamily  = ($script:Config.FontFamily  -replace '[\r\n]', '')
-        $safeLastLogFile = ($script:Config.LastLogFile -replace '[\r\n]', '')
-        $lines = New-Object System.Collections.Generic.List[string]
-        $lines.Add("[Settings]")
-        $lines.Add("FontFamily=$safeFontFamily")
-        $lines.Add("FontSize=$($script:Config.FontSize)")
-        $lines.Add("BottomPanelHeight=$($script:Config.BottomPanelHeight)")
-        $lines.Add("FormatJson=$($script:Config.FormatJson)")
-        $lines.Add("SplitComma=$($script:Config.SplitComma)")
-        $lines.Add("SplitSpace=$($script:Config.SplitSpace)")
-        $lines.Add("SplitPeriod=$($script:Config.SplitPeriod)")
-        $lines.Add("UpdateSpeed=$($script:Config.UpdateSpeed)")
-        $lines.Add("LastLogFile=$safeLastLogFile")
-        $lines.Add("WindowWidth=$($script:Config.WindowWidth)")
-        $lines.Add("WindowHeight=$($script:Config.WindowHeight)")
-        $lines.Add("StatsSortColumn=$($script:Config.StatsSortColumn)")
-        $lines.Add("StatsSortDirection=$($script:Config.StatsSortDirection)")
-        $lines.Add("")
-        $lines.Add("[Keywords]")
-        foreach ($kv in $script:Config.Keywords.GetEnumerator()) {
-            $safeKey = ($kv.Key   -replace '[\r\n]', '')
-            $safeVal = ($kv.Value -replace '[\r\n]', '')
-            $lines.Add("$safeKey=$safeVal")
-        }
-        $lines.Add("")
-        $lines.Add("[Delimiters]")
-        $i = 1
-        foreach ($d in $script:Config.CustomDelimiters) {
-            $safeDelim = ($d -replace '[\r\n]', '')
-            $lines.Add("$i=$safeDelim")
-            $i++
-        }
-        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        [System.IO.File]::WriteAllLines($script:ConfigPath, $lines, $utf8NoBom)
-    } catch {
-        Report-Error "Export-Config" "Failed to save settings: $_" -ShowDialog -Icon ([System.Windows.MessageBoxImage]::Error)
-    }
-}
-
-Import-Config
-
-#endregion
-
-#region --- Background Runspace Script ---
-
-$bgScript = {
-    param(
-        [string]$FilePath,
-        [System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]] $OrderedKeywords,
-        [System.Collections.Concurrent.ConcurrentQueue[object]] $LogQueue,
-        [System.Threading.CancellationToken] $CancellationToken,
-        [SharedLogState] $SharedState,
-        [int] $PollIntervalMs
-    )
-
-    $lastFileLength    = $SharedState.LastFileLength
-    $pendingBuffer     = $SharedState.PendingBuffer
-    $buffer            = New-Object System.Text.StringBuilder
-    $consecutiveErrors = 0
-    $maxBackoffMs      = 30000
-
-    while (-not $CancellationToken.IsCancellationRequested) {
-        $reader = $null
-        $stream = $null
-        try {
-            $fileInfo = [System.IO.FileInfo]::new($FilePath)
-            $fileInfo.Refresh()
-
-            if (-not $fileInfo.Exists) {
-                [void]$CancellationToken.WaitHandle.WaitOne($PollIntervalMs)
-                continue
-            }
-
-            $currentLength = $fileInfo.Length
-
-            if ($currentLength -lt $lastFileLength) {
-                $lastFileLength = 0
-                $pendingBuffer  = ""
-                [void]$buffer.Clear()
-            }
-
-            if ($currentLength -gt $lastFileLength) {
-                $stream = [System.IO.File]::Open(
-                    $FilePath,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read,
-                    [System.IO.FileShare]::ReadWrite)
-
-                try {
-                    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 65536)
-                    $stream = $null
-                } catch {
-                    if ($null -ne $stream) { $stream.Dispose(); $stream = $null }
-                    throw
-                }
-
-                [void]$reader.BaseStream.Seek($lastFileLength, [System.IO.SeekOrigin]::Begin)
-                $lastFileLength = $currentLength
-
-                [void]$buffer.Clear()
-                if ($pendingBuffer.Length -gt 0) {
-                    [void]$buffer.Append($pendingBuffer)
-                    $pendingBuffer = ""
-                }
-
-                $line = $null
-                while (($line = $reader.ReadLine()) -ne $null) {
-                    if ($line.StartsWith('<![LOG[') -and $buffer.Length -gt 0) {
-                        $entry = [LogParser]::ParseLine($buffer.ToString(), $OrderedKeywords)
-                        if ($null -ne $entry) { $LogQueue.Enqueue($entry) }
-                        [void]$buffer.Clear()
-                        [void]$buffer.Append($line)
-                    } elseif ($line.StartsWith('<![LOG[')) {
-                        [void]$buffer.Clear()
-                        [void]$buffer.Append($line)
-                    } elseif ($buffer.Length -gt 0) {
-                        [void]$buffer.AppendLine($line)
-                    } else {
-                        $entry = [LogParser]::ParseLine($line, $OrderedKeywords)
-                        if ($null -ne $entry) { $LogQueue.Enqueue($entry) }
+                    switch (key)
+                    {
+                        case "FontFamily": if (value.Length > 0) cfg.FontFamily = value; break;
+                        case "FontSize": if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var fs) && fs > 0) cfg.FontSize = fs; break;
+                        case "BottomPanelHeight": if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var bh) && bh >= 0) cfg.BottomPanelHeight = bh; break;
+                        case "FormatJson": cfg.FormatJson = ParseBool(value, cfg.FormatJson); break;
+                        case "SplitComma": cfg.SplitComma = ParseBool(value, cfg.SplitComma); break;
+                        case "SplitSpace": cfg.SplitSpace = ParseBool(value, cfg.SplitSpace); break;
+                        case "SplitPeriod": cfg.SplitPeriod = ParseBool(value, cfg.SplitPeriod); break;
+                        case "CustomDelimiters":
+                            cfg.CustomDelimiters = new List<string>(
+                                value.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                            break;
+                        case "UpdateSpeed": if (int.TryParse(value, out var us)) cfg.UpdateSpeed = Math.Clamp(us, 1, 5); break;
+                        case "UiScale": if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var sc)) cfg.UiScale = Math.Clamp(sc, 0.75, 1.5); break;
+                        case "TextColor": if (TextColorPresets.ContainsKey(value)) cfg.TextColorName = value; break;
+                        case "LastLogFile": cfg.LastLogFile = value; break;
+                        case "WindowWidth": if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var ww) && ww >= 400) cfg.WindowWidth = ww; break;
+                        case "WindowHeight": if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var wh) && wh >= 300) cfg.WindowHeight = wh; break;
+                        case "StatsSortColumn": if (value == "Type" || value == "Count" || value == "Percentage") cfg.StatsSortColumn = value; break;
+                        case "StatsSortDirection": if (value == "Ascending" || value == "Descending") cfg.StatsSortDirection = value; break;
+                        // A Theme key from the toggle build falls
+                        // through unhandled on purpose: dark only.
                     }
                 }
-
-                if ($buffer.Length -gt 0) {
-                    $bufferStr = $buffer.ToString()
-                    if ($bufferStr.StartsWith('<![LOG[') -and -not $bufferStr.Contains("]LOG]!>")) {
-                        $pendingBuffer = $bufferStr
-                    } else {
-                        $entry = [LogParser]::ParseLine($bufferStr, $OrderedKeywords)
-                        if ($null -ne $entry) { $LogQueue.Enqueue($entry) }
-                        $pendingBuffer = ""
-                    }
-                }
-
-                [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
-                try {
-                    $SharedState.LastFileLength = $lastFileLength
-                    $SharedState.PendingBuffer  = $pendingBuffer
-                    if (-not $SharedState.InitialLoadComplete) {
-                        $SharedState.InitialLoadComplete = $true
-                    }
-                } finally {
-                    [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
-                }
-
-                $consecutiveErrors = 0
             }
-        } catch [System.IO.IOException] {
-            $consecutiveErrors++
-            $backoffMs = [Math]::Min($PollIntervalMs * [Math]::Pow(2, $consecutiveErrors), $maxBackoffMs)
-            [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
-            try {
-                $SharedState.LastError = "IO error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss') on '$FilePath': $_"
-            } finally {
-                [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
+            catch
+            {
+                // A damaged config file must never stop the viewer starting:
+                // fall back to whatever parsed cleanly, like the original.
             }
-            [void]$CancellationToken.WaitHandle.WaitOne([int]$backoffMs)
-            continue
-        } catch {
-            $consecutiveErrors++
-            $backoffMs = [Math]::Min($PollIntervalMs * [Math]::Pow(2, $consecutiveErrors), $maxBackoffMs)
-            [System.Threading.Monitor]::Enter($SharedState.SyncRoot)
-            try {
-                $SharedState.LastError = "Unexpected error ($consecutiveErrors) at $(Get-Date -Format 'HH:mm:ss'): $_"
-            } finally {
-                [System.Threading.Monitor]::Exit($SharedState.SyncRoot)
-            }
-            [void]$CancellationToken.WaitHandle.WaitOne([int]$backoffMs)
-            continue
-        } finally {
-            if ($null -ne $reader) { $reader.Dispose(); $reader = $null }
-            if ($null -ne $stream) { $stream.Dispose(); $stream = $null }
+            return cfg;
         }
 
-        [void]$CancellationToken.WaitHandle.WaitOne($PollIntervalMs)
+        public void Save()
+        {
+            try
+            {
+                var lines = new List<string>
+                {
+                    "[Settings]",
+                    $"FontFamily={FontFamily}",
+                    $"FontSize={FontSize.ToString(CultureInfo.InvariantCulture)}",
+                    $"BottomPanelHeight={BottomPanelHeight.ToString(CultureInfo.InvariantCulture)}",
+                    $"FormatJson={FormatJson}",
+                    $"SplitComma={SplitComma}",
+                    $"SplitSpace={SplitSpace}",
+                    $"SplitPeriod={SplitPeriod}",
+                    $"CustomDelimiters={string.Join(";", CustomDelimiters)}",
+                    $"UpdateSpeed={UpdateSpeed}",
+                    $"UiScale={UiScale.ToString(CultureInfo.InvariantCulture)}",
+                    $"TextColor={TextColorName}",
+                    $"LastLogFile={LastLogFile}",
+                    $"WindowWidth={WindowWidth.ToString(CultureInfo.InvariantCulture)}",
+                    $"WindowHeight={WindowHeight.ToString(CultureInfo.InvariantCulture)}",
+                    $"StatsSortColumn={StatsSortColumn}",
+                    $"StatsSortDirection={StatsSortDirection}",
+                    "",
+                    "[Keywords]",
+                };
+                foreach (var kv in Keywords) lines.Add($"{kv.Key}={kv.Value}");
+                File.WriteAllLines(ConfigPath, lines);
+            }
+            catch (Exception ex)
+            {
+                ErrorLog.Report("Export-Config", $"Could not save settings: {ex.Message}");
+            }
+        }
+
+        private static bool ParseBool(string value, bool fallback)
+        {
+            if (bool.TryParse(value, out bool b)) return b;
+            if (value == "1") return true;
+            if (value == "0") return false;
+            return fallback;
+        }
+    }
+
+    // Operational error log, mirroring the original viewer's in-memory list
+    // (capped at 500 entries) shown by Tools, View Error Log.
+    public static class ErrorLog
+    {
+        private const int MaxEntries = 500;
+        private static readonly List<string> EntriesList = new List<string>();
+        private static readonly object Gate = new object();
+
+        public static event Action? Changed;
+
+        public static void Report(string context, string message)
+        {
+            string entry = $"[{DateTime.Now:HH:mm:ss}] {context} : {message}";
+            lock (Gate)
+            {
+                EntriesList.Add(entry);
+                int excess = EntriesList.Count - MaxEntries;
+                if (excess > 0) EntriesList.RemoveRange(0, excess);
+            }
+            Changed?.Invoke();
+        }
+
+        public static List<string> Snapshot()
+        {
+            lock (Gate) return new List<string>(EntriesList);
+        }
+    }
+
+    // The bottom detail panel formatter from the original viewer: pretty
+    // print JSON when the message looks like JSON, then split the text at
+    // the configured delimiters so long structured messages read as lines.
+    public static class DetailFormatter
+    {
+        private const int MaxJsonFormatLength = 100000;
+        private const int JsonFormatDepth = 50;
+
+        public static string Format(string rawMsg, AppConfig config)
+        {
+            string msg = rawMsg ?? "";
+            if (config.FormatJson)
+            {
+                string trimMsg = msg.TrimStart();
+                if (trimMsg.Length < MaxJsonFormatLength &&
+                    (trimMsg.StartsWith("{") || trimMsg.StartsWith("[")))
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(msg);
+                        var options = new JsonSerializerOptions
+                        {
+                            WriteIndented = true,
+                            MaxDepth = JsonFormatDepth,
+                        };
+                        msg = JsonSerializer.Serialize(doc.RootElement, options);
+                    }
+                    catch
+                    {
+                        ErrorLog.Report("Format-LogDetails", "JSON formatting skipped: message is not valid JSON.");
+                    }
+                }
+            }
+            if (config.SplitComma) msg = msg.Replace(",", ",\r\n");
+            if (config.SplitSpace) msg = msg.Replace(" ", " \r\n");
+            if (config.SplitPeriod) msg = msg.Replace(".", ".\r\n");
+            foreach (string d in config.CustomDelimiters)
+            {
+                if (!string.IsNullOrWhiteSpace(d))
+                {
+                    msg = msg.Replace(d, d + "\r\n");
+                }
+            }
+            return msg;
+        }
     }
 }
-
-#endregion
-
-#region --- Main Window XAML ---
-
-$script:MainXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+'@
+ $mwAxaml=@'
+<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:sys="clr-namespace:System;assembly=mscorlib"
+        xmlns:local="using:__APPNAME__"
+        x:Class="__APPNAME__.MainWindow"
         Title="Configuration Manager Trace Log Tool"
-        Height="$($script:Config.WindowHeight)"
-        Width="$($script:Config.WindowWidth)"
+        Width="1200" Height="700" MinWidth="720" MinHeight="300"
+        FontFamily="Segoe UI, Inter, DejaVu Sans, sans-serif"
+        RequestedThemeVariant="Dark"
         WindowStartupLocation="CenterScreen">
-    <Window.Resources>
-        <Style TargetType="DataGridCell">
-            <Setter Property="Background"       Value="Transparent"/>
-            <Setter Property="BorderBrush"      Value="Transparent"/>
-            <Setter Property="FocusVisualStyle"  Value="{x:Null}"/>
-            <Setter Property="Foreground" Value="{Binding RelativeSource={RelativeSource AncestorType=DataGridRow}, Path=Foreground}"/>
-        </Style>
-        <x:Array x:Key="ColorList" Type="sys:String">
-            <sys:String>Red</sys:String>
-            <sys:String>Orange</sys:String>
-            <sys:String>Yellow</sys:String>
-            <sys:String>Green</sys:String>
-            <sys:String>Blue</sys:String>
-            <sys:String>Purple</sys:String>
-            <sys:String>White</sys:String>
-        </x:Array>
-    </Window.Resources>
-    <Grid>
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <Grid Grid.Column="0">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*" MinHeight="100"/>
-                <RowDefinition Height="5"/>
-                <RowDefinition x:Name="BottomRowDef" Height="$($script:Config.BottomPanelHeight)" MinHeight="80"/>
-            </Grid.RowDefinitions>
-            <Menu Grid.Row="0" Background="#FFF0F0F0">
-                <MenuItem Header="_File">
-                    <MenuItem Header="_Open..."    Name="OpenMenu"     InputGestureText="Ctrl+O"/>
-                    <Separator/>
-                    <MenuItem Header="_Exit"       Name="ExitMenu"/>
-                </MenuItem>
-                <MenuItem Header="_Edit">
-                    <MenuItem Header="_Find..."    Name="FindMenu"     InputGestureText="Ctrl+F"/>
-                </MenuItem>
-                <MenuItem Header="_Tools">
-                    <MenuItem Header="_Settings..." Name="SettingsMenu"/>
-                    <Separator/>
-                    <MenuItem Header="View _Error Log" Name="ErrorLogMenu"/>
-                </MenuItem>
-            </Menu>
-            <DockPanel Grid.Row="1" Background="#FFF0F0F0" Margin="0,2,0,2">
-                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Margin="0,0,5,0">
-                    <TextBlock Text="Find:" VerticalAlignment="Center" Margin="5,0,0,0" FontWeight="Bold"/>
-                    <TextBox  Name="SearchBox"      Width="250" Margin="5,0,0,0" VerticalAlignment="Center"/>
-                    <Button   Name="SearchBtn"      Content="Find Next" Width="80" Margin="5,0,0,0"/>
-                    <Button   Name="ClearSearchBtn" Content="Clear"     Width="50" Margin="5,0,0,0"/>
-                </StackPanel>
-                <StackPanel Orientation="Horizontal">
-                    <ToggleButton Name="PauseBtn"  Content="Pause Auto-Refresh" Width="150" Margin="5,0,0,0"/>
-                    <ToggleButton Name="ScrollBtn" Content="Auto-Scroll: ON"    Width="150" Margin="5,0,0,0" IsChecked="True"/>
-                </StackPanel>
-            </DockPanel>
-            <Border Grid.Row="2" Background="#FFE8E8E8" BorderBrush="#FFD0D0D0" BorderThickness="0,1,0,1" Padding="4,3,4,3">
-                <DockPanel>
-                    <TextBlock Text="Filter:" FontWeight="Bold" VerticalAlignment="Center" Margin="2,0,6,0" DockPanel.Dock="Left"/>
-                    <WrapPanel Name="FilterPanel" Orientation="Horizontal" VerticalAlignment="Center"/>
-                </DockPanel>
-            </Border>
-            <Grid Grid.Row="3">
-                <DataGrid Name="LogDataGrid"
-                          Background="White" Foreground="Black"
-                          GridLinesVisibility="None"
-                          HeadersVisibility="Column"
-                          AutoGenerateColumns="False"
-                          IsReadOnly="True"
-                          SelectionMode="Extended"
-                          SelectionUnit="FullRow"
-                          CanUserAddRows="False"
-                          CanUserDeleteRows="False"
-                          CanUserResizeRows="False"
-                          CanUserReorderColumns="False"
-                          BorderThickness="1,0,1,1" BorderBrush="#FFD0D0D0"
-                          ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                          ScrollViewer.VerticalScrollBarVisibility="Auto"
-                          VirtualizingPanel.IsVirtualizing="True"
-                          VirtualizingPanel.VirtualizationMode="Recycling"
-                          VirtualizingPanel.ScrollUnit="Item">
-                    <DataGrid.ContextMenu>
-                        <ContextMenu>
-                            <MenuItem Header="Copy to Clipboard" Name="ContextCopyMenu"/>
-                        </ContextMenu>
-                    </DataGrid.ContextMenu>
-                    <DataGrid.Columns>
-                        <DataGridTextColumn Header="Log Entry" Binding="{Binding Message}" Width="*">
-                            <DataGridTextColumn.ElementStyle>
-                                <Style TargetType="TextBlock">
-                                    <Setter Property="TextWrapping" Value="NoWrap"/>
-                                </Style>
-                            </DataGridTextColumn.ElementStyle>
-                        </DataGridTextColumn>
-                    </DataGrid.Columns>
-                </DataGrid>
-                <Grid Name="OpenLogOverlay" Background="White" Panel.ZIndex="10" Visibility="Visible">
-                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Orientation="Vertical">
-                        <TextBlock Text="Click here to open a log file"
-                                   FontSize="18" FontWeight="SemiBold" Foreground="#FF555555"
-                                   HorizontalAlignment="Center" Margin="0,0,0,16"/>
-                        <Button Name="OpenLogOverlayBtn" Content="Open Log File" FontSize="14" HorizontalAlignment="Center">
-                            <Button.Style>
-                                <Style TargetType="Button">
-                                    <Setter Property="Background"       Value="#FF1976D2"/>
-                                    <Setter Property="Foreground"       Value="White"/>
-                                    <Setter Property="BorderThickness"  Value="0"/>
-                                    <Setter Property="Padding"          Value="24,10,24,10"/>
-                                    <Setter Property="FontSize"         Value="14"/>
-                                    <Setter Property="Cursor"           Value="Hand"/>
-                                    <Setter Property="Template">
-                                        <Setter.Value>
-                                            <ControlTemplate TargetType="Button">
-                                                <Border Name="Bd"
-                                                        Background="{TemplateBinding Background}"
-                                                        CornerRadius="4"
-                                                        Padding="{TemplateBinding Padding}">
-                                                    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                                                </Border>
-                                                <ControlTemplate.Triggers>
-                                                    <Trigger Property="IsMouseOver" Value="True">
-                                                        <Setter TargetName="Bd" Property="Background" Value="#FF1565C0"/>
-                                                    </Trigger>
-                                                    <Trigger Property="IsPressed" Value="True">
-                                                        <Setter TargetName="Bd" Property="Background" Value="#FF0D47A1"/>
-                                                    </Trigger>
-                                                </ControlTemplate.Triggers>
-                                            </ControlTemplate>
-                                        </Setter.Value>
-                                    </Setter>
-                                </Style>
-                            </Button.Style>
-                        </Button>
-                    </StackPanel>
-                </Grid>
+  <!-- The whole window content sits in a LayoutTransformControl so
+       the Settings UI scale (AppConfig.UiScale) scales the entire
+       interface layout, not just a render zoom. The code-behind sets
+       its LayoutTransform from the configured scale. -->
+  <LayoutTransformControl Name="RootScale">
+  <Grid Name="RootGrid" ColumnDefinitions="*,Auto">
+    <Grid Name="LeftGrid" Grid.Column="0" RowDefinitions="Auto,Auto,*,Auto,150,Auto">
+
+      <!-- Menu strip: the File / Edit / Tools menu, the transport icon
+           buttons and the search controls share one horizontal strip
+           (folded into a single row to save vertical space). Menus on
+           the left, search on the right. -->
+      <Border Grid.Row="0" Background="{DynamicResource PSTracePanelBg}">
+        <!-- Command bar (2026 redesign): menu, an accent Open
+             button, the transport toggles, then the search cluster
+             on the right. The filter row below shares this surface,
+             so the two rows read as one command surface with a
+             single hairline under the filters. The search box is an
+             inset well: magnifier glyph, borderless box with the
+             Search watermark, and the live match count inside the
+             well's right edge. Prev / Next / Clear are quiet ghost
+             buttons beside it. -->
+        <Grid ColumnDefinitions="Auto,Auto,Auto,*" Margin="8,6,10,6">
+          <Menu Grid.Column="0" VerticalAlignment="Center" Background="Transparent">
+            <MenuItem Header="_File">
+              <MenuItem Header="_Open..." Name="OpenMenu" InputGesture="Ctrl+O"/>
+              <MenuItem Header="Open _Remote..." Name="OpenRemoteMenu"/>
+              <Separator/>
+              <MenuItem Header="_Exit" Name="ExitMenu"/>
+            </MenuItem>
+            <MenuItem Header="_Tools">
+              <MenuItem Header="_Settings..." Name="SettingsMenu"/>
+            </MenuItem>
+          </Menu>
+          <Button Grid.Column="1" Name="OpenStripBtn" Classes="accent" Content="Open"
+                  Height="30" Padding="14,0,14,0" CornerRadius="6" VerticalAlignment="Center" Margin="8,0,0,0"
+                  HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                  ToolTip.Tip="Open a log file (Ctrl+O)"/>
+          <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0" Spacing="6">
+            <Border Width="1" Background="{DynamicResource PSTraceBorder}" Margin="2,5,2,5"/>
+            <!-- Icon-only transport buttons. The state lives in the icon
+                 (pause bars vs play triangle; scroll glyph dimmed when
+                 off, button highlighted when on) and in the hover
+                 tooltip, which names the action and the state. The
+                 code-behind keeps both in sync. -->
+            <ToggleButton Name="PauseBtn" Classes="transport" Width="30" Height="30" Padding="0"
+                          HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                          ToolTip.Tip="Pause auto-refresh">
+              <!-- Both glyphs are drawn on the same 16x16 field with
+                   their geometry centred on (8,8): the pause bars
+                   span x 3..13 (3 wide each, 3 gap, 3 margins), the
+                   play triangle spans x 5..13.5 with its centroid at
+                   x 7.8, the optical centre of a triangle. Each Path
+                   is explicitly centred in the button so nothing in
+                   the template can drift it off centre. -->
+              <Grid Width="16" Height="16" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <Path Name="PauseIcon" Width="16" Height="16" Stretch="Uniform"
+                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                      Fill="{DynamicResource PSTraceText}"
+                      Data="M3,2.5 L6,2.5 L6,13.5 L3,13.5 Z M10,2.5 L13,2.5 L13,13.5 L10,13.5 Z"/>
+                <Path Name="PlayIcon" Width="16" Height="16" Stretch="Uniform"
+                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                      Fill="{DynamicResource PSTraceText}" IsVisible="False"
+                      Data="M5,2.5 L13.5,8 L5,13.5 Z"/>
+              </Grid>
+            </ToggleButton>
+            <ToggleButton Name="ScrollBtn" Classes="transport" Width="30" Height="30" Padding="0"
+                          HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                          IsChecked="True" ToolTip.Tip="Auto-scroll: on">
+              <!-- CMTrace-style auto-scroll glyph: log lines on the
+                   left, a bold arrow descending to the baseline on
+                   the right. One path, same flat weight as the pause
+                   glyph. -->
+              <Path Name="ScrollIcon" Width="16" Height="16" Stretch="Uniform"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Fill="{DynamicResource PSTraceText}"
+                    Data="M1.5,2.2 L8,2.2 L8,3.8 L1.5,3.8 Z M1.5,5.9 L8,5.9 L8,7.5 L1.5,7.5 Z M1.5,9.6 L5.6,9.6 L5.6,11.2 L1.5,11.2 Z M10.9,1.4 L13.1,1.4 L13.1,8.2 L15.2,8.2 L12,13 L8.8,8.2 L10.9,8.2 Z M1.5,14 L14.5,14 L14.5,15.4 L1.5,15.4 Z"/>
+            </ToggleButton>
+            <!-- Copy every loaded log line to the clipboard
+                 (Brandon, Nov 22). Two overlapping sheets: the back
+                 sheet as an outline, the front sheet filled, on the
+                 same 16x16 field as the transport glyphs. -->
+            <Button Name="CopyAllBtn" Classes="ghost" Width="30" Height="30" Padding="0"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                    ToolTip.Tip="Copy all log lines to the clipboard">
+              <Path Width="16" Height="16" Stretch="Uniform"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Fill="{DynamicResource PSTraceText}"
+                    Data="M5.5,1.5 L14.5,1.5 L14.5,10.5 L12.5,10.5 L12.5,3.5 L5.5,3.5 Z M3.5,5.5 L11.5,5.5 L11.5,14.5 L3.5,14.5 Z"/>
+            </Button>
+          </StackPanel>
+          <!-- Prev / Next / Clear live INSIDE the search well
+               (Brandon, Nov 22): one combined search control, the
+               buttons quiet ghosts at the well's right edge after
+               the match count. -->
+          <Border Grid.Column="3" Classes="inset" VerticalAlignment="Center" Margin="14,0,0,0"
+                  MinWidth="170" MaxWidth="560" HorizontalAlignment="Stretch">
+            <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto,Auto">
+              <Path Grid.Column="0" Width="14" Height="14" Margin="9,0,0,0"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Stroke="{DynamicResource PSTraceMutedText}" StrokeThickness="1.6"
+                    Data="M10.2,10.2 L14.5,14.5 M6.8,1.8 A5,5 0 1 0 6.8,11.8 A5,5 0 1 0 6.8,1.8"/>
+              <TextBox Grid.Column="1" Name="SearchBox" Watermark="Search"
+                       Background="Transparent" BorderThickness="0"
+                       VerticalAlignment="Center" Margin="6,0,0,0"/>
+              <TextBlock Grid.Column="2" Name="SearchCountText" VerticalAlignment="Center"
+                         FontSize="11.5" Foreground="{DynamicResource PSTraceMutedText}" Margin="6,0,4,0"/>
+              <Button Grid.Column="3" Name="PrevBtn" Classes="ghost" Content="Prev"
+                      ToolTip.Tip="Jump to the previous match"
+                      Padding="8,0,8,0" Height="24" VerticalAlignment="Center" Margin="2,0,0,0"
+                      HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+              <Button Grid.Column="4" Name="SearchBtn" Classes="ghost" Content="Next"
+                      ToolTip.Tip="Jump to the next match"
+                      Padding="8,0,8,0" Height="24" VerticalAlignment="Center" Margin="1,0,0,0"
+                      HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+              <Button Grid.Column="5" Name="ClearSearchBtn" Classes="ghost" Content="Clear"
+                      ToolTip.Tip="Clear the search text"
+                      Padding="8,0,8,0" Height="24" VerticalAlignment="Center" Margin="1,0,4,0"
+                      HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
             </Grid>
-            <GridSplitter Grid.Row="4" Height="5" HorizontalAlignment="Stretch" Background="#FFD0D0D0" ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"/>
-            <Grid Grid.Row="5">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                <Border Grid.Row="0" Background="#FFE8E8E8" BorderBrush="#FFD0D0D0" BorderThickness="1,0,1,1" Padding="5,3,5,3">
-                    <DockPanel>
-                        <Button Name="CopyDetailBtn" Content="Copy to Clipboard" DockPanel.Dock="Right" Padding="10,2,10,2"/>
-                        <TextBlock Text="Details" FontWeight="Bold" VerticalAlignment="Center"/>
-                    </DockPanel>
-                </Border>
-                <TextBox Grid.Row="1" Name="DetailTextBox"
-                         IsReadOnly="True"
-                         Background="#FFF8F8F8"
-                         BorderThickness="1,0,1,1" BorderBrush="#FFD0D0D0"
-                         VerticalScrollBarVisibility="Auto"
-                         HorizontalScrollBarVisibility="Auto"
-                         TextWrapping="Wrap"
-                         Padding="5,5,5,5"/>
-            </Grid>
+          </Border>
         </Grid>
-        <Border Grid.Column="1" Background="#FFF8F8F8" BorderBrush="#FFD0D0D0" BorderThickness="1,0,0,0" MinWidth="220" MaxWidth="280">
-            <DockPanel Margin="0">
-                <Border DockPanel.Dock="Top" Background="#FFE0E0E0" BorderBrush="#FFD0D0D0" BorderThickness="0,0,0,1" Padding="8,6,8,6">
-                    <TextBlock Text="Log Statistics" FontWeight="Bold" FontSize="12"/>
-                </Border>
-                <Border DockPanel.Dock="Top" Background="#FFF0F0F0" BorderBrush="#FFD0D0D0" BorderThickness="0,0,0,1" Padding="0">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="65"/>
-                            <ColumnDefinition Width="55"/>
-                        </Grid.ColumnDefinitions>
-                        <Button Grid.Column="0" Name="SortTypeBtn"  Content="Type"  HorizontalContentAlignment="Left"  Background="Transparent" BorderThickness="0" Padding="8,6,4,6" Cursor="Hand"/>
-                        <Button Grid.Column="1" Name="SortCountBtn" Content="Count" HorizontalContentAlignment="Right" Background="Transparent" BorderThickness="0" Padding="4,6,4,6" Cursor="Hand"/>
-                        <Button Grid.Column="2" Name="SortPctBtn"   Content="%"     HorizontalContentAlignment="Right" Background="Transparent" BorderThickness="0" Padding="4,6,8,6" Cursor="Hand"/>
-                    </Grid>
-                </Border>
-                <Border DockPanel.Dock="Bottom" Background="#FFE8E8E8" BorderBrush="#FFD0D0D0" BorderThickness="0,1,0,0" Padding="8,6,8,6">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="65"/>
-                            <ColumnDefinition Width="55"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Total" FontWeight="Bold"/>
-                        <TextBlock Grid.Column="1" Name="TotalCountText" Text="0" FontWeight="Bold" TextAlignment="Right"/>
-                        <TextBlock Grid.Column="2" Text="100%" FontWeight="Bold" TextAlignment="Right" Foreground="#FF888888"/>
-                    </Grid>
-                </Border>
-                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel Name="StatsPanel" Margin="0"/>
-                </ScrollViewer>
-            </DockPanel>
+      </Border>
+
+      <!-- Filter chips: a wrapping strip with NO horizontal
+           scrollbar (Brandon, Nov 22). The ScrollViewer stays only
+           as a width constraint: with horizontal scrolling disabled
+           the WrapPanel is sized to the strip and wraps chips onto
+           a second line when the window is narrow. -->
+      <Border Grid.Row="1" Background="{DynamicResource PSTracePanelBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="0,0,0,1" Padding="10,0,10,7">
+        <DockPanel>
+          <TextBlock Text="FILTER" FontWeight="SemiBold" FontSize="10.5" Foreground="{DynamicResource PSTraceMutedText}" VerticalAlignment="Center" Margin="0,0,10,0" DockPanel.Dock="Left"/>
+          <ScrollViewer Name="FilterScrollViewer" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Disabled">
+            <WrapPanel Name="FilterPanel" VerticalAlignment="Center"/>
+          </ScrollViewer>
+        </DockPanel>
+      </Border>
+
+      <Grid Grid.Row="2">
+        <DataGrid Name="LogDataGrid"
+                  Background="{DynamicResource PSTraceSurfaceBg}" Foreground="{DynamicResource PSTraceText}"
+                  GridLinesVisibility="Horizontal"
+                  HorizontalGridLinesBrush="{DynamicResource PSTraceGridLine}"
+                  HeadersVisibility="Column"
+                  AutoGenerateColumns="False"
+                  IsReadOnly="True"
+                  SelectionMode="Extended"
+                  CanUserResizeColumns="False"
+                  CanUserReorderColumns="True"
+                  CanUserSortColumns="False"
+                  RowHeight="25"
+                  ColumnHeaderHeight="32"
+                  BorderThickness="0">
+          <DataGrid.ContextMenu>
+            <ContextMenu>
+              <MenuItem Header="Copy to Clipboard" Name="ContextCopyMenu"/>
+            </ContextMenu>
+          </DataGrid.ContextMenu>
+          <DataGrid.Columns>
+            <!-- Default order is Time, Type, Log Text (Brandon,
+                 Nov 22); headers can still be dragged to rearrange. -->
+            <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="122"/>
+            <DataGridTextColumn Header="Type" Binding="{Binding Level}" Width="96"/>
+            <DataGridTextColumn Header="Log Text" Binding="{Binding DisplayText}" Width="*"/>
+            <DataGridTextColumn Header="Component" Binding="{Binding Component}" Width="164"/>
+            <DataGridTextColumn Header="Thread" Binding="{Binding Thread}" Width="112"/>
+          </DataGrid.Columns>
+        </DataGrid>
+        <Grid Name="OpenLogOverlay" Background="{DynamicResource PSTraceSurfaceBg}" ZIndex="10" IsVisible="True">
+          <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Orientation="Vertical">
+            <TextBlock Text="Click here to open a log file"
+                       FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource PSTraceText}"
+                       HorizontalAlignment="Center" Margin="0,0,0,16"/>
+            <Button Name="OpenLogOverlayBtn" Content="Open Log File" Classes="accent" FontSize="14" HorizontalAlignment="Center"
+                    Padding="24,10,24,10" Cursor="Hand"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+            <TextBlock Text="or drag and drop a log file onto this window"
+                       FontSize="12" Foreground="{DynamicResource PSTraceMutedText}"
+                       HorizontalAlignment="Center" Margin="0,10,0,0"/>
+          </StackPanel>
+        </Grid>
+      </Grid>
+
+      <GridSplitter Grid.Row="3" Height="5" HorizontalAlignment="Stretch" Background="{DynamicResource PSTraceBorder}" ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"/>
+
+      <!-- Details pane: a header band, a structured field strip for the
+           selected entry (the CMTrace info pane fields), and the
+           formatted message body below. -->
+      <Grid Grid.Row="4" RowDefinitions="Auto,Auto,*" Background="{DynamicResource PSTraceSurfaceBg}">
+        <Border Grid.Row="0" Padding="12,7,12,0">
+          <DockPanel>
+            <Button Name="CopyDetailBtn" Classes="ghost" Content="Copy" DockPanel.Dock="Right" Padding="10,4,10,4" FontSize="12"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+            <TextBlock Text="Details" Classes="section-header" FontSize="12" VerticalAlignment="Center"/>
+          </DockPanel>
         </Border>
+        <Border Grid.Row="1" Padding="12,6,12,0">
+          <WrapPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,26,0">
+              <TextBlock Text="TIME" Classes="field-label" VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Name="DetailTimeText" Classes="field-value" VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,26,0">
+              <TextBlock Text="DATE" Classes="field-label" VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Name="DetailDateText" Classes="field-value" VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,26,0">
+              <TextBlock Text="TYPE" Classes="field-label" VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Name="DetailTypeText" Classes="field-value" VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,26,0">
+              <TextBlock Text="COMPONENT" Classes="field-label" VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Name="DetailComponentText" Classes="field-value" VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,26,0">
+              <TextBlock Text="THREAD" Classes="field-label" VerticalAlignment="Center" Margin="0,0,7,0"/>
+              <TextBlock Name="DetailThreadText" Classes="field-value" VerticalAlignment="Center"/>
+            </StackPanel>
+          </WrapPanel>
+        </Border>
+        <Border Grid.Row="2" Classes="detail-well" Margin="12,8,12,10">
+          <TextBox Name="DetailTextBox"
+                   IsReadOnly="True"
+                   Background="Transparent"
+                   Foreground="{DynamicResource PSTraceText}"
+                   BorderThickness="0"
+                   ScrollViewer.VerticalScrollBarVisibility="Visible"
+                   ScrollViewer.HorizontalScrollBarVisibility="Visible"
+                   TextWrapping="Wrap"
+                   Padding="10,8,10,8"
+                   FontFamily="Consolas"/>
+        </Border>
+      </Grid>
+
+      <Border Grid.Row="5" Background="{DynamicResource PSTraceBandBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="0,1,0,0" Padding="10,4,10,4">
+        <TextBlock Name="StatusText" Text="No log file open." FontSize="12" Foreground="{DynamicResource PSTraceText}" VerticalAlignment="Center"/>
+      </Border>
     </Grid>
+
+    <!-- Statistics panel: header band aligned with the menu strip, a
+         sortable column header row, one row per level with a colour
+         swatch, and a totals footer. -->
+    <Border Grid.Column="1" Background="{DynamicResource PSTraceSurfaceBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="1,0,0,0" Width="200">
+      <DockPanel>
+        <Border DockPanel.Dock="Top" Background="{DynamicResource PSTracePanelBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="0,0,0,1">
+          <TextBlock Text="Statistics" Classes="section-header" FontSize="12" VerticalAlignment="Center" Margin="12,10,12,10"/>
+        </Border>
+        <Border DockPanel.Dock="Top" Background="{DynamicResource PSTraceSurfaceBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="0,0,0,1">
+          <Grid ColumnDefinitions="*,56,54" Margin="0,2,14,2">
+            <Button Grid.Column="0" Name="SortTypeBtn" Content="Type" HorizontalContentAlignment="Left" Background="Transparent" BorderThickness="0" Padding="10,4,4,4" Cursor="Hand" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PSTraceMutedText}"/>
+            <Button Grid.Column="1" Name="SortCountBtn" Content="Count" HorizontalContentAlignment="Right" Background="Transparent" BorderThickness="0" Padding="4,4,4,4" Cursor="Hand" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PSTraceMutedText}"/>
+            <Button Grid.Column="2" Name="SortPctBtn" Content="%" HorizontalContentAlignment="Right" Background="Transparent" BorderThickness="0" Padding="4,4,10,4" Cursor="Hand" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PSTraceMutedText}"/>
+          </Grid>
+        </Border>
+        <Border DockPanel.Dock="Bottom" Background="{DynamicResource PSTracePanelBg}" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="0,1,0,0" Padding="10,6,10,6">
+          <Grid ColumnDefinitions="*,56,54" Margin="0,0,14,0">
+            <TextBlock Grid.Column="0" Text="Total" FontWeight="SemiBold" FontSize="12"/>
+            <TextBlock Grid.Column="1" Name="TotalCountText" Text="0" FontWeight="SemiBold" FontSize="12" TextAlignment="Right"/>
+            <TextBlock Grid.Column="2" Text="100%" FontWeight="SemiBold" FontSize="12" TextAlignment="Right" Foreground="{DynamicResource PSTraceMutedText}"/>
+          </Grid>
+        </Border>
+        <!-- Clicking a type row above filters the grid to that type
+             only; this button restores every type. It lives on the
+             right, under the statistics, next to the totals. -->
+        <Button DockPanel.Dock="Bottom" Name="ClearFilterBtn" Content="Clear filter"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                VerticalContentAlignment="Center" Margin="10,6,10,6" Padding="10,4,10,4"
+                ToolTip.Tip="Show every log type again"/>
+        <ScrollViewer Name="StatsScrollViewer" VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Disabled">
+          <!-- The right margin reserves the scroll bar's own lane
+               (Brandon, Nov 22): rows never slide under the bar, so
+               the % column stays readable at any UI scale. -->
+          <StackPanel Name="StatsPanel" Margin="0,0,14,0"/>
+        </ScrollViewer>
+      </DockPanel>
+    </Border>
+  </Grid>
+  </LayoutTransformControl>
 </Window>
-"@
+'@
+ $mwCs=@'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.Documents;
+using Avalonia.Controls.Primitives;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Styling;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
 
-#endregion
+namespace __APPNAME__
+{
+    public partial class MainWindow : Window
+    {
+        // Named constants carried over from the original viewer.
+        private const int MaxDrainPerTick = 10000;
+        private const int PollIntervalMs = 500;
+        private const int MaxRetainedEntries = 10000000;
+        private const int TrimThreshold = 11000000;
 
-#region --- Create Main Window and Resolve Named Controls ---
+        private readonly AppConfig _config;
+        private readonly ObservableRangeCollection<LogEntry> _master = new ObservableRangeCollection<LogEntry>();
+        private readonly ObservableRangeCollection<LogEntry> _display = new ObservableRangeCollection<LogEntry>();
+        private readonly Dictionary<string, bool> _activeFilter = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ToggleButton> _chips = new Dictionary<string, ToggleButton>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IBrush> _brushCache = new Dictionary<string, IBrush>(StringComparer.OrdinalIgnoreCase);
 
-try {
-    $script:MainWindow = New-XamlWindow -XamlText $script:MainXaml -Context "Main window"
-    if ($null -eq $script:MainWindow) { return }
+        private DataGrid _logGrid = null!;
+        private Grid _overlay = null!;
+        private TextBox _searchBox = null!;
+        private TextBox _detailText = null!;
+        private TextBlock _statusText = null!;
+        private TextBlock _totalCountText = null!;
+        private StackPanel _statsPanel = null!;
+        private WrapPanel _filterPanel = null!;
+        private LayoutTransformControl _rootScale = null!;
+        private TextBlock _detailTimeText = null!;
+        private TextBlock _detailDateText = null!;
+        private TextBlock _detailTypeText = null!;
+        private TextBlock _detailComponentText = null!;
+        private TextBlock _detailThreadText = null!;
+        private ToggleButton _pauseBtn = null!;
+        private ToggleButton _scrollBtn = null!;
+        private TextBlock _searchCountText = null!;
+        private Button _clearFilterBtn = null!;
+        private Avalonia.Controls.Shapes.Path _pauseIcon = null!;
+        private Avalonia.Controls.Shapes.Path _playIcon = null!;
+        private Avalonia.Controls.Shapes.Path _scrollIcon = null!;
+        private Button _sortTypeBtn = null!;
+        private Button _sortCountBtn = null!;
+        private Button _sortPctBtn = null!;
+        private Grid _leftGrid = null!;
 
-    $OpenMenu          = Get-RequiredNamedControl $script:MainWindow "OpenMenu"          "Main window"
-    $ExitMenu          = Get-RequiredNamedControl $script:MainWindow "ExitMenu"          "Main window"
-    $FindMenu          = Get-RequiredNamedControl $script:MainWindow "FindMenu"          "Main window"
-    $SettingsMenu      = Get-RequiredNamedControl $script:MainWindow "SettingsMenu"      "Main window"
-    $ErrorLogMenu      = Get-RequiredNamedControl $script:MainWindow "ErrorLogMenu"      "Main window"
-    $LogDataGrid       = Get-RequiredNamedControl $script:MainWindow "LogDataGrid"       "Main window"
-    $DetailTextBox     = Get-RequiredNamedControl $script:MainWindow "DetailTextBox"     "Main window"
-    $CopyDetailBtn     = Get-RequiredNamedControl $script:MainWindow "CopyDetailBtn"     "Main window"
-    $PauseBtn          = Get-RequiredNamedControl $script:MainWindow "PauseBtn"          "Main window"
-    $ScrollBtn         = Get-RequiredNamedControl $script:MainWindow "ScrollBtn"         "Main window"
-    $SearchBox         = Get-RequiredNamedControl $script:MainWindow "SearchBox"         "Main window"
-    $SearchBtn         = Get-RequiredNamedControl $script:MainWindow "SearchBtn"         "Main window"
-    $ClearSearchBtn    = Get-RequiredNamedControl $script:MainWindow "ClearSearchBtn"    "Main window"
-    $FilterPanel       = Get-RequiredNamedControl $script:MainWindow "FilterPanel"       "Main window"
-    $TotalCountText    = Get-RequiredNamedControl $script:MainWindow "TotalCountText"    "Main window"
-    $StatsPanel        = Get-RequiredNamedControl $script:MainWindow "StatsPanel"        "Main window"
-    $SortTypeBtn       = Get-RequiredNamedControl $script:MainWindow "SortTypeBtn"       "Main window"
-    $SortCountBtn      = Get-RequiredNamedControl $script:MainWindow "SortCountBtn"      "Main window"
-    $SortPctBtn        = Get-RequiredNamedControl $script:MainWindow "SortPctBtn"        "Main window"
-    $ContextCopyMenu   = Get-RequiredNamedControl $script:MainWindow "ContextCopyMenu"   "Main window"
-    $OpenLogOverlay    = Get-RequiredNamedControl $script:MainWindow "OpenLogOverlay"    "Main window"
-    $OpenLogOverlayBtn = Get-RequiredNamedControl $script:MainWindow "OpenLogOverlayBtn" "Main window"
+        private LogTailer? _tailer;
+        private DispatcherTimer? _drainTimer;
+        private DispatcherTimer? _statsTimer;
+        private DispatcherTimer? _searchTimer;
+        private string? _exclusiveLevel;
+        private bool _syncingFilter;
+        private string? _currentFile;
+        private bool _paused;
+        private bool _initialFlushing;
+        private bool _statsDirty = true;
+        private string? _lastShownTailError;
+        private string _lastSearchText = "";
+        // The text colour currently painted: the config value, or
+        // the Settings dialog's live preview while it is open.
+        private string _effectiveTextColorHex = AppConfig.TextColorPresets["Dim White"];
+        private bool _anyComponent;
+        private bool _anyThread;
 
-    $BottomRow = $script:MainWindow.FindName("BottomRowDef")
-    if ($null -eq $BottomRow) {
-        Report-Error "Init" "Could not resolve BottomRowDef - bottom panel height will not persist."
-    }
-} catch {
-    Show-FatalError -Title "Unhandled Startup error" -Context "Startup failed." -Exception $_.Exception
-    return
-}
+        public MainWindow()
+        {
+            _config = AppConfig.Load();
+            InitializeComponent();
 
-#endregion
+            _leftGrid = this.FindControl<Grid>("LeftGrid")!;
+            _logGrid = this.FindControl<DataGrid>("LogDataGrid")!;
+            _overlay = this.FindControl<Grid>("OpenLogOverlay")!;
+            _searchBox = this.FindControl<TextBox>("SearchBox")!;
+            _detailText = this.FindControl<TextBox>("DetailTextBox")!;
+            _statusText = this.FindControl<TextBlock>("StatusText")!;
+            _totalCountText = this.FindControl<TextBlock>("TotalCountText")!;
+            _statsPanel = this.FindControl<StackPanel>("StatsPanel")!;
+            _filterPanel = this.FindControl<WrapPanel>("FilterPanel")!;
+            _rootScale = this.FindControl<LayoutTransformControl>("RootScale")!;
+            _detailTimeText = this.FindControl<TextBlock>("DetailTimeText")!;
+            _detailDateText = this.FindControl<TextBlock>("DetailDateText")!;
+            _detailTypeText = this.FindControl<TextBlock>("DetailTypeText")!;
+            _detailComponentText = this.FindControl<TextBlock>("DetailComponentText")!;
+            _detailThreadText = this.FindControl<TextBlock>("DetailThreadText")!;
+            _pauseBtn = this.FindControl<ToggleButton>("PauseBtn")!;
+            _scrollBtn = this.FindControl<ToggleButton>("ScrollBtn")!;
+            _searchCountText = this.FindControl<TextBlock>("SearchCountText")!;
+            _clearFilterBtn = this.FindControl<Button>("ClearFilterBtn")!;
+            _pauseIcon = this.FindControl<Avalonia.Controls.Shapes.Path>("PauseIcon")!;
+            _playIcon = this.FindControl<Avalonia.Controls.Shapes.Path>("PlayIcon")!;
+            _scrollIcon = this.FindControl<Avalonia.Controls.Shapes.Path>("ScrollIcon")!;
+            _sortTypeBtn = this.FindControl<Button>("SortTypeBtn")!;
+            _sortCountBtn = this.FindControl<Button>("SortCountBtn")!;
+            _sortPctBtn = this.FindControl<Button>("SortPctBtn")!;
 
-#region --- Global Runtime State ---
+            Width = Math.Max(400, _config.WindowWidth);
+            Height = Math.Max(300, _config.WindowHeight);
+            SetDetailRowHeight(_config.BottomPanelHeight);
 
-$script:State = @{
-    CurrentLogFile    = $null
-    Cts               = $null
-    RunspacePS        = $null
-    RunspaceObj       = $null
-    AsyncResult       = $null
-    LogQueue          = $null
-    SharedState       = $null
-    MasterList        = New-Object System.Collections.Generic.List[LogEntry]($script:InitialCapacity)
-    DisplayCollection = New-Object ObservableRangeCollection[LogEntry]
-    FilterCheckboxes  = @{}
-    ActiveLevelFilter = @{}
-    StatsRowCache     = New-Object 'System.Collections.Generic.Dictionary[string,hashtable]'(
-        [System.StringComparer]::OrdinalIgnoreCase)
-    WasTailingBeforeSearch = $false
-}
+            // Dark only: App pinned the dark variant at startup and
+            // the chrome brushes in App.axaml carry the Atrium
+            // palette, so there is nothing theme-related to apply
+            // here.
 
-$script:LogScrollViewer = $null
+            _logGrid.ItemsSource = _master;
+            _logGrid.LoadingRow += OnGridLoadingRow;
+            _logGrid.SelectionChanged += OnGridSelectionChanged;
 
-#endregion
+            ApplyFontSettings();
+            ApplyUiScale();
+            UpdateDetailPane(null);
+            UpdatePauseVisual();
+            UpdateScrollVisual();
+            RebuildFilterBar();
+            UpdateSortButtonLabels();
+            RefreshStats();
 
-#region --- Stats Panel ---
+            WireEvents();
+            SetupDragAndDrop();
 
-function Update-SortButtonLabels {
-    $col   = $script:Config.StatsSortColumn
-    $dir   = $script:Config.StatsSortDirection
-    $arrow = if ($dir -eq "Ascending") { " ^" } else { " v" }
-    $SortTypeBtn.Content  = if ($col -eq "Type")       { "Type$arrow" }  else { "Type" }
-    $SortCountBtn.Content = if ($col -eq "Count")      { "Count$arrow" } else { "Count" }
-    $SortPctBtn.Content   = if ($col -eq "Percentage") { "%$arrow" }     else { "%" }
-}
+            _searchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+            _searchTimer.Tick += (_, _) =>
+            {
+                _searchTimer.Stop();
+                ApplyLiveSearch();
+            };
 
-function Get-SortedStats {
-    param([System.Collections.Generic.List[LevelCount]]$Stats)
-    if ($null -eq $Stats -or $Stats.Count -eq 0) { return $Stats }
-    $col = $script:Config.StatsSortColumn
-    $dir = $script:Config.StatsSortDirection
-    if ($col -eq "Type") {
-        if ($dir -eq "Ascending") { return $Stats | Sort-Object Level }
-        else { return $Stats | Sort-Object Level -Descending }
-    } elseif ($col -eq "Count") {
-        if ($dir -eq "Ascending") { return $Stats | Sort-Object Count }
-        else { return $Stats | Sort-Object Count -Descending }
-    } elseif ($col -eq "Percentage") {
-        if ($dir -eq "Ascending") { return $Stats | Sort-Object Percentage }
-        else { return $Stats | Sort-Object Percentage -Descending }
-    } else {
-        return $Stats | Sort-Object Count
-    }
-}
+            _drainTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            _drainTimer.Tick += OnDrainTick;
+            _statsTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _statsTimer.Tick += (_, _) =>
+            {
+                if (_statsDirty) { RefreshStats(); _statsDirty = false; }
+                ShowTailErrorIfNew();
+            };
+            _statsTimer.Start();
 
-function Set-StatsSort {
-    param([string]$Column)
-    if ($script:Config.StatsSortColumn -eq $Column) {
-        if ($script:Config.StatsSortDirection -eq "Ascending") {
-            $script:Config.StatsSortDirection = "Descending"
-        } else {
-            $script:Config.StatsSortDirection = "Ascending"
+            Closed += OnWindowClosed;
         }
-    } else {
-        $script:Config.StatsSortColumn    = $Column
-        $script:Config.StatsSortDirection = "Ascending"
-    }
-    Update-SortButtonLabels
-    Update-StatusBar -Force
-}
 
-$SortTypeBtn.Add_Click({  Set-StatsSort -Column "Type" })
-$SortCountBtn.Add_Click({ Set-StatsSort -Column "Count" })
-$SortPctBtn.Add_Click({   Set-StatsSort -Column "Percentage" })
+        // ------------------------------------------------------------------
+        // Wiring
+        // ------------------------------------------------------------------
 
-Update-SortButtonLabels
+        private void WireEvents()
+        {
+            this.FindControl<MenuItem>("OpenMenu")!.Click += async (_, _) => await PickAndOpenFileAsync();
+            this.FindControl<MenuItem>("OpenRemoteMenu")!.Click += async (_, _) => await ShowRemoteOpenAsync();
+            this.FindControl<MenuItem>("ExitMenu")!.Click += (_, _) => Close();
+            this.FindControl<Button>("OpenStripBtn")!.Click += async (_, _) => await PickAndOpenFileAsync();
+            this.FindControl<Button>("PrevBtn")!.Click += (_, _) => DoFindPrevious();
+            this.FindControl<MenuItem>("SettingsMenu")!.Click += async (_, _) => await ShowSettingsAsync();
+            this.FindControl<MenuItem>("ContextCopyMenu")!.Click += async (_, _) => await CopySelectedRowsAsync();
+            this.FindControl<Button>("CopyAllBtn")!.Click += async (_, _) => await CopyAllLogsAsync();
+            this.FindControl<Button>("OpenLogOverlayBtn")!.Click += async (_, _) => await PickAndOpenFileAsync();
+            _overlay.PointerPressed += async (_, _) => await PickAndOpenFileAsync();
 
-$script:LastStatsUpdate = [DateTime]::MinValue
+            this.FindControl<Button>("SearchBtn")!.Click += (_, _) => DoFind();
+            this.FindControl<Button>("ClearSearchBtn")!.Click += (_, _) =>
+            {
+                _searchBox.Text = "";
+                _logGrid.Focus();
+            };
+            _searchBox.KeyDown += (_, e) =>
+            {
+                // Enter cycles through the matches, one match per
+                // press, wrapping at the ends; Shift+Enter walks
+                // backwards. Both key values are accepted: Avalonia
+                // reports the main Enter key as Return and the
+                // keypad key as Enter, and checking only Enter left
+                // the main key dead (Brandon, Nov 22).
+                if (e.Key == Key.Return || e.Key == Key.Enter)
+                {
+                    if (e.KeyModifiers.HasFlag(KeyModifiers.Shift)) DoFindPrevious();
+                    else DoFind();
+                    e.Handled = true;
+                }
+            };
+            // Live search: every text change restarts the debounce
+            // timer; when it fires, matches are located and counted
+            // without the user pressing anything.
+            _searchBox.PropertyChanged += (_, e) =>
+            {
+                if (e.Property == TextBox.TextProperty && _searchTimer != null)
+                {
+                    _searchTimer.Stop();
+                    _searchTimer.Start();
+                }
+            };
+            _clearFilterBtn.Click += (_, _) => ClearExclusiveFilter();
 
-function Update-StatusBar {
-    param([switch]$Force)
-    $masterList        = $script:State.MasterList
-    $displayCollection = $script:State.DisplayCollection
-    $cache             = $script:State.StatsRowCache
+            _pauseBtn.IsCheckedChanged += (_, _) =>
+            {
+                _paused = _pauseBtn.IsChecked == true;
+                UpdatePauseVisual();
+                UpdateStatus();
+            };
+            _scrollBtn.IsCheckedChanged += (_, _) =>
+            {
+                UpdateScrollVisual();
+                // Turning auto-scroll on snaps the view to the newest
+                // entry right away, like CMTrace.
+                if (_scrollBtn.IsChecked == true) RequestAutoScroll();
+            };
+            this.FindControl<Button>("CopyDetailBtn")!.Click += async (_, _) => await CopyTextAsync(_detailText.Text ?? "");
 
-    $total = if ($null -ne $masterList) { $masterList.Count } else { 0 }
-    if ($null -ne $TotalCountText) { $TotalCountText.Text = $total.ToString("N0") }
-    if ($null -eq $StatsPanel) { return }
+            _sortTypeBtn.Click += (_, _) => SetStatsSort("Type");
+            _sortCountBtn.Click += (_, _) => SetStatsSort("Count");
+            _sortPctBtn.Click += (_, _) => SetStatsSort("Percentage");
 
-    $visible = if ($null -ne $displayCollection) { $displayCollection.Count } else { 0 }
-
-    if ($visible -eq 0) {
-        $StatsPanel.Children.Clear()
-        $cache.Clear()
-        return
-    }
-
-    if (-not $Force -and ([DateTime]::Now - $script:LastStatsUpdate).TotalMilliseconds -lt 1000) {
-        return
-    }
-    $script:LastStatsUpdate = [DateTime]::Now
-
-    $stats       = [LogParser]::GetLevelStatistics($displayCollection)
-    $sortedStats = Get-SortedStats -Stats $stats
-
-    $incomingLevels = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($s in $sortedStats) { [void]$incomingLevels.Add($s.Level) }
-
-    $cacheKeys    = @($cache.Keys)
-    $cacheChanged = $false
-    foreach ($k in $cacheKeys) {
-        if (-not $incomingLevels.Contains($k)) {
-            $cache.Remove($k)
-            $cacheChanged = $true
+            KeyDown += (_, e) =>
+            {
+                if (e.KeyModifiers.HasFlag(KeyModifiers.Control) && e.Key == Key.O)
+                {
+                    _ = PickAndOpenFileAsync();
+                    e.Handled = true;
+                }
+                else if (e.KeyModifiers.HasFlag(KeyModifiers.Control) && e.Key == Key.F)
+                {
+                    FocusSearch();
+                    e.Handled = true;
+                }
+            };
         }
-    }
-    foreach ($lvl in $incomingLevels) {
-        if (-not $cache.ContainsKey($lvl)) { $cacheChanged = $true; break }
-    }
 
-    if ($cacheChanged) {
-        $StatsPanel.Children.Clear()
-        foreach ($stat in $sortedStats) {
-            $lvl = $stat.Level
-            if (-not $cache.ContainsKey($lvl)) {
-                $colorName = $script:Config.Keywords[$lvl]
-                $bgHex     = "#FFFFFFFF"
-                $textHex   = "#FF424242"
-                if ($colorName -and (Test-ColorMapKey $colorName)) {
-                    $bgHex = $script:ColorMap[$colorName]
-                    if (Test-TextColorMapKey $colorName) {
-                        $textHex = $script:TextColorMap[$colorName]
+        // ------------------------------------------------------------------
+        // Theme: dark only, themed after the Atrium client. The
+        // variant is pinned in App, the chrome colours live in the
+        // App.axaml resources (DynamicResource), and the severity
+        // colours painted in code come from AppConfig's single dark
+        // palette. There is no toggle and nothing to restyle.
+        // ------------------------------------------------------------------
+
+        // ------------------------------------------------------------------
+        // Icon-only transport buttons: the icon and the tooltip carry the
+        // state, there is no text on either button. Pause swaps between
+        // pause bars (running, click to pause) and a play triangle
+        // (paused, click to resume). Auto-scroll keeps one glyph and
+        // shows its state by highlight and opacity.
+        // ------------------------------------------------------------------
+
+        private void UpdatePauseVisual()
+        {
+            bool paused = _pauseBtn.IsChecked == true;
+            _pauseIcon.IsVisible = !paused;
+            _playIcon.IsVisible = paused;
+            ToolTip.SetTip(_pauseBtn, paused ? "Resume auto-refresh" : "Pause auto-refresh");
+        }
+
+        private void UpdateScrollVisual()
+        {
+            bool on = _scrollBtn.IsChecked == true;
+            _scrollIcon.Opacity = on ? 1.0 : 0.4;
+            // The "on" wash is the Atrium accent (the selection
+            // colour); the "off" wash is a neutral step up from the
+            // strip's chrome colour.
+            _scrollBtn.Background = on
+                ? GetBrush("#FF1C58D9")
+                : GetBrush("#FF2B3948");
+            ToolTip.SetTip(_scrollBtn, on ? "Auto-scroll: on" : "Auto-scroll: off");
+        }
+
+        // ------------------------------------------------------------------
+        // Feature B: drag and drop files onto the running window.
+        // The window accepts file drops at any time, not only on the
+        // empty-state overlay. The first dropped file is opened; any
+        // additional files are reported in the status bar, not opened.
+        // ------------------------------------------------------------------
+
+        private void SetupDragAndDrop()
+        {
+            DragDrop.SetAllowDrop(this, true);
+            AddHandler(DragDrop.DragOverEvent, OnDragOver);
+            AddHandler(DragDrop.DragEnterEvent, OnDragOver);
+            AddHandler(DragDrop.DropEvent, OnDrop);
+        }
+
+        private void OnDragOver(object? sender, DragEventArgs e)
+        {
+            e.DragEffects = e.Data.Contains(DataFormats.Files)
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
+            e.Handled = true;
+        }
+
+        private void OnDrop(object? sender, DragEventArgs e)
+        {
+            e.Handled = true;
+            var paths = ExtractDroppedPaths(e);
+            if (paths.Count == 0) return;
+            OpenLogFile(paths[0]);
+            if (paths.Count > 1)
+            {
+                _statusText.Text = $"Opened {paths[0]} ({paths.Count - 1} other dropped file(s) not opened).";
+            }
+        }
+
+        private static List<string> ExtractDroppedPaths(DragEventArgs e)
+        {
+            var result = new List<string>();
+            try
+            {
+                var files = e.Data.GetFiles();
+                if (files != null)
+                {
+                    foreach (var item in files.OfType<IStorageFile>())
+                    {
+                        string path = item.Path.LocalPath;
+                        if (string.IsNullOrEmpty(path)) continue;
+                        // A dropped network file arrives as a UNC path.
+                        // Do not probe it with File.Exists on the UI
+                        // thread: a dead host would stall the window for
+                        // the whole SMB timeout. The tailer reports
+                        // reachability instead.
+                        if (RemoteLogPath.IsUnc(path) || File.Exists(path)) result.Add(path);
                     }
                 }
-                $bgBrush   = Get-CachedBrush $bgHex
-                $textBrush = Get-CachedBrush $textHex
-
-                $rowBorder                 = New-Object System.Windows.Controls.Border
-                $rowBorder.BorderBrush     = [System.Windows.Media.Brushes]::LightGray
-                $rowBorder.BorderThickness = "0,0,0,1"
-                $rowBorder.Padding         = "8,5,8,5"
-
-                $rowGrid = New-Object System.Windows.Controls.Grid
-                $c0 = New-Object System.Windows.Controls.ColumnDefinition
-                $c0.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-                $c1 = New-Object System.Windows.Controls.ColumnDefinition
-                $c1.Width = [System.Windows.GridLength]::new(65)
-                $c2 = New-Object System.Windows.Controls.ColumnDefinition
-                $c2.Width = [System.Windows.GridLength]::new(55)
-                [void]$rowGrid.ColumnDefinitions.Add($c0)
-                [void]$rowGrid.ColumnDefinitions.Add($c1)
-                [void]$rowGrid.ColumnDefinitions.Add($c2)
-
-                $typeBorder                     = New-Object System.Windows.Controls.Border
-                $typeBorder.Background          = $bgBrush
-                $typeBorder.CornerRadius        = "3"
-                $typeBorder.Padding             = "6,2,6,2"
-                $typeBorder.HorizontalAlignment = "Left"
-                $typeBorder.VerticalAlignment   = "Center"
-
-                $typeText            = New-Object System.Windows.Controls.TextBlock
-                $typeText.Text       = $lvl
-                $typeText.FontWeight = "SemiBold"
-                $typeText.Foreground = $textBrush
-                $typeText.FontSize   = 11
-
-                $typeBorder.Child = $typeText
-                [System.Windows.Controls.Grid]::SetColumn($typeBorder, 0)
-                [void]$rowGrid.Children.Add($typeBorder)
-
-                $countText                   = New-Object System.Windows.Controls.TextBlock
-                $countText.TextAlignment     = "Right"
-                $countText.VerticalAlignment = "Center"
-                $countText.FontWeight        = "SemiBold"
-                [System.Windows.Controls.Grid]::SetColumn($countText, 1)
-                [void]$rowGrid.Children.Add($countText)
-
-                $pctText                   = New-Object System.Windows.Controls.TextBlock
-                $pctText.TextAlignment     = "Right"
-                $pctText.VerticalAlignment = "Center"
-                $pctText.Foreground        = [System.Windows.Media.Brushes]::Gray
-                [System.Windows.Controls.Grid]::SetColumn($pctText, 2)
-                [void]$rowGrid.Children.Add($pctText)
-
-                $rowBorder.Child = $rowGrid
-                $cache[$lvl] = @{ Border = $rowBorder; CountText = $countText; PctText = $pctText }
             }
-            [void]$StatsPanel.Children.Add($cache[$lvl].Border)
-        }
-    } else {
-        $idx = 0
-        foreach ($stat in $sortedStats) {
-            $border  = $cache[$stat.Level].Border
-            $current = $StatsPanel.Children[$idx]
-            if (-not [object]::ReferenceEquals($current, $border)) {
-                [void]$StatsPanel.Children.Remove($border)
-                $StatsPanel.Children.Insert($idx, $border)
+            catch (Exception ex)
+            {
+                ErrorLog.Report("DragDrop", $"Could not read dropped files: {ex.Message}");
             }
-            $idx++
-        }
-    }
-
-    foreach ($stat in $sortedStats) {
-        $row = $cache[$stat.Level]
-        $row.CountText.Text = $stat.Count.ToString("N0")
-        $row.PctText.Text   = "$([Math]::Round($stat.Percentage, 1))%"
-    }
-}
-
-#endregion
-
-#region --- Filter Bar ---
-
-$script:FilterDebounceTimer          = New-Object System.Windows.Threading.DispatcherTimer
-$script:FilterDebounceTimer.Interval = [TimeSpan]::FromMilliseconds(300)
-$script:FilterDebounceTimer.Add_Tick({
-    $script:FilterDebounceTimer.Stop()
-    Invoke-ApplyFilter
-})
-
-function Invoke-RebuildFilterBar {
-    $FilterPanel.Children.Clear()
-    $script:State.FilterCheckboxes  = @{}
-    $script:State.ActiveLevelFilter = @{}
-
-    $levels = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($k in $script:Config.Keywords.Keys) { [void]$levels.Add($k) }
-    foreach ($l in @([LogLevels]::Error, [LogLevels]::Warning, [LogLevels]::Info, [LogLevels]::Verbose)) {
-        [void]$levels.Add($l)
-    }
-
-    $allTag        = [FilterTags]::All
-    $allCb         = New-Object System.Windows.Controls.CheckBox
-    $allCb.Content = "All"
-    $allCb.IsChecked  = $true
-    $allCb.Margin     = "4,0,8,0"
-    $allCb.FontWeight = "Bold"
-    $allCb.Tag        = $allTag
-    $allCb.Add_Click({
-        param($s, $e)
-        $checked   = ($s.IsChecked -eq $true)
-        $filterTag = [FilterTags]::All
-        foreach ($cb in $script:State.FilterCheckboxes.Values) {
-            if ($cb.Tag -ne $filterTag) {
-                $cb.IsChecked = $checked
-                $script:State.ActiveLevelFilter[$cb.Tag] = $checked
-            }
-        }
-        Request-FilterUpdate
-    })
-    [void]$FilterPanel.Children.Add($allCb)
-    $script:State.FilterCheckboxes[$allTag] = $allCb
-
-    foreach ($level in ($levels | Sort-Object)) {
-        $cb           = New-Object System.Windows.Controls.CheckBox
-        $cb.Content   = $level
-        $cb.Tag       = $level
-        $cb.IsChecked = $true
-        $cb.Margin    = "4,0,4,0"
-
-        $colorName = $script:Config.Keywords[$level]
-        if ($colorName -and (Test-ColorMapKey $colorName)) {
-            $hex = $script:ColorMap[$colorName]
-            try {
-                $cb.Background = Get-CachedBrush $hex
-            } catch {
-                Report-Error "Invoke-RebuildFilterBar" "Brush error for level '$level': $_"
-            }
+            return result;
         }
 
-        $script:State.ActiveLevelFilter[$level] = $true
+        // ------------------------------------------------------------------
+        // Opening files (picker, command line via App, drag and drop)
+        // ------------------------------------------------------------------
 
-        $cb.Add_Click({
-            param($s, $e)
-            $script:State.ActiveLevelFilter[$s.Tag] = ($s.IsChecked -eq $true)
-            $filterTag    = [FilterTags]::All
-            $anyUnchecked = $script:State.FilterCheckboxes.Values | Where-Object { $_.Tag -ne $filterTag -and $_.IsChecked -ne $true }
-            $script:State.FilterCheckboxes[$filterTag].IsChecked = ($null -eq $anyUnchecked)
-            Request-FilterUpdate
-        })
+        public void OpenLogFile(string path)
+        {
+            try
+            {
+                StopTailing();
+                _master.Clear();
+                _display.Clear();
+                _anyComponent = false;
+                _anyThread = false;
+                UpdateDetailPane(null);
+                _currentFile = path;
+                _config.LastLogFile = path;
+                Title = $"Configuration Manager Trace Log Tool - {Path.GetFileName(path)}";
+                _overlay.IsVisible = false;
+                _initialFlushing = true;
+                _lastShownTailError = null;
 
-        [void]$FilterPanel.Children.Add($cb)
-        $script:State.FilterCheckboxes[$level] = $cb
-    }
-}
-
-function Request-FilterUpdate {
-    $script:FilterDebounceTimer.Stop()
-    $script:FilterDebounceTimer.Start()
-}
-
-function Invoke-ApplyFilter {
-    $filterDict = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
-    foreach ($kv in $script:State.ActiveLevelFilter.GetEnumerator()) {
-        $filterDict[$kv.Key] = [bool]$kv.Value
-    }
-    $visible = [LogParser]::FilterEntries($script:State.MasterList, $filterDict)
-    $script:State.DisplayCollection.ReplaceAll($visible)
-    
-    if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
-    if ($ScrollBtn.IsChecked -and $null -ne $script:LogScrollViewer) {
-        $script:LogScrollViewer.ScrollToEnd()
-    }
-    Update-StatusBar -Force
-}
-
-function Add-VisibleEntries {
-    param([System.Collections.Generic.List[LogEntry]]$Entries)
-    
-    $allVisible = $true
-    foreach ($val in $script:State.ActiveLevelFilter.Values) {
-        if (-not $val) { $allVisible = $false; break }
-    }
-    
-    if ($allVisible) {
-        if ($Entries.Count -gt 0) {
-            $script:State.DisplayCollection.AddRange($Entries)
-        }
-    } else {
-        $filterDict = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
-        foreach ($kv in $script:State.ActiveLevelFilter.GetEnumerator()) {
-            $filterDict[$kv.Key] = [bool]$kv.Value
-        }
-        $toAdd = [LogParser]::FilterEntries($Entries, $filterDict)
-        if ($toAdd.Count -gt 0) {
-            $script:State.DisplayCollection.AddRange($toAdd)
-        }
-    }
-    Update-StatusBar
-}
-
-#endregion
-
-#region --- Runspace Management ---
-
-function Stop-LogTailing {
-    $st = $script:State
-    if ($null -ne $st.Cts) { $st.Cts.Cancel() }
-
-    if ($null -ne $st.RunspacePS) {
-        try {
-            if ($null -ne $st.AsyncResult -and -not $st.AsyncResult.IsCompleted) {
-                [void]$st.AsyncResult.AsyncWaitHandle.WaitOne($script:RunspaceShutdownMs)
-            }
-            if ($null -ne $st.AsyncResult) {
-                $st.RunspacePS.EndInvoke($st.AsyncResult)
-            }
-        } catch { Report-Error "Stop-LogTailing" "EndInvoke error: $_" }
-        try { $st.RunspacePS.Stop() }    catch { Report-Error "Stop-LogTailing" "Stop error: $_" }
-        try { $st.RunspacePS.Dispose() } catch { Report-Error "Stop-LogTailing" "Dispose error: $_" }
-        $st.RunspacePS  = $null
-        $st.AsyncResult = $null
-    }
-
-    if ($null -ne $st.RunspaceObj) {
-        try { $st.RunspaceObj.Close() }   catch { Report-Error "Stop-LogTailing" "Runspace.Close error: $_" }
-        try { $st.RunspaceObj.Dispose() } catch { Report-Error "Stop-LogTailing" "Runspace.Dispose error: $_" }
-        $st.RunspaceObj = $null
-    }
-
-    if ($null -ne $st.Cts) {
-        $st.Cts.Dispose()
-        $st.Cts = $null
-    }
-}
-
-function Start-LogTailing {
-    param(
-        [string]$FilePath,
-        [bool]$ResetState = $false
-    )
-    Stop-LogTailing
-    $st = $script:State
-
-    if ($ResetState -or $null -eq $st.SharedState) {
-        $st.SharedState = New-Object SharedLogState
-        Set-TimerInterval ([TimeSpan]::FromMilliseconds($script:FastTimerIntervalMs))
-    } else {
-        [System.Threading.Monitor]::Enter($st.SharedState.SyncRoot)
-        try {
-            $st.SharedState.InitialLoadComplete    = $false
-            $st.SharedState.IsFlushingInitialQueue = $true
-            $st.SharedState.LastError              = $null
-        } finally {
-            [System.Threading.Monitor]::Exit($st.SharedState.SyncRoot)
-        }
-        Set-TimerInterval ([TimeSpan]::FromMilliseconds($script:FastTimerIntervalMs))
-    }
-
-    if ($null -ne $st.LogQueue) {
-        $discarded = $null
-        while ($st.LogQueue.TryDequeue([ref]$discarded)) {}
-    }
-    $st.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-
-    $orderedKeywords = Get-SortedKeywords
-    try {
-        $st.Cts         = New-Object System.Threading.CancellationTokenSource
-        $st.RunspaceObj = [runspacefactory]::CreateRunspace()
-        $st.RunspaceObj.Open()
-        $st.RunspacePS          = [System.Management.Automation.PowerShell]::Create()
-        $st.RunspacePS.Runspace = $st.RunspaceObj
-        $null = $st.RunspacePS.AddScript($bgScript)
-        $null = $st.RunspacePS.AddArgument($FilePath)
-        $null = $st.RunspacePS.AddArgument($orderedKeywords)
-        $null = $st.RunspacePS.AddArgument($st.LogQueue)
-        $null = $st.RunspacePS.AddArgument($st.Cts.Token)
-        $null = $st.RunspacePS.AddArgument($st.SharedState)
-        $null = $st.RunspacePS.AddArgument($script:PollIntervalMs)
-        $st.AsyncResult = $st.RunspacePS.BeginInvoke()
-    } catch {
-        Report-Error "Start-LogTailing" "Failed to start background runspace: $_"
-        Stop-LogTailing
-        try { Set-TimerInterval ([TimeSpan]::FromSeconds($script:Config.UpdateSpeed)) } catch {}
-    }
-    Update-StatusBar -Force
-}
-
-#endregion
-
-#region --- Row Styling ---
-
-function Set-GuiFromConfig {
-    try {
-        $font = New-Object System.Windows.Media.FontFamily($script:Config.FontFamily)
-        $LogDataGrid.FontFamily   = $font
-        $DetailTextBox.FontFamily = $font
-        $LogDataGrid.FontSize     = $script:Config.FontSize
-        $DetailTextBox.FontSize   = $script:Config.FontSize
-
-        if ($null -ne $BottomRow) {
-            $BottomRow.Height = New-Object System.Windows.GridLength([double]$script:Config.BottomPanelHeight)
-        } else {
-            Report-Error "Set-GuiFromConfig" "BottomRow is null - panel height not applied."
-        }
-
-        $rowStyle = New-Object System.Windows.Style([System.Windows.Controls.DataGridRow])
-        $rowStyle.Setters.Add((New-Object System.Windows.Setter(
-            [System.Windows.Controls.DataGridRow]::BackgroundProperty,
-            [System.Windows.Media.Brushes]::White)))
-        $rowStyle.Setters.Add((New-Object System.Windows.Setter(
-            [System.Windows.Controls.DataGridRow]::ForegroundProperty,
-            [System.Windows.Media.Brushes]::Black)))
-
-        foreach ($kw in $script:Config.Keywords.Keys) {
-            $colorName = $script:Config.Keywords[$kw]
-            $hex = if (Test-ColorMapKey $colorName) { $script:ColorMap[$colorName] } else { "#FFFFFFFF" }
-            try {
-                $brush           = Get-CachedBrush $hex
-                $trigger         = New-Object System.Windows.DataTrigger
-                $trigger.Binding = New-Object System.Windows.Data.Binding("Level")
-                $trigger.Value   = $kw
-                $trigger.Setters.Add((New-Object System.Windows.Setter(
-                    [System.Windows.Controls.DataGridRow]::BackgroundProperty, $brush)))
-                $rowStyle.Triggers.Add($trigger)
-            } catch {
-                Report-Error "Set-GuiFromConfig" "Brush error for keyword '$kw': $_"
-            }
-        }
-
-        $selectedBrush = Get-CachedBrush "#FF3399FF"
-        $selectedFg    = [System.Windows.Media.Brushes]::White
-
-        $selectedTrigger          = New-Object System.Windows.Trigger
-        $selectedTrigger.Property = [System.Windows.Controls.DataGridRow]::IsSelectedProperty
-        $selectedTrigger.Value    = $true
-        $selectedTrigger.Setters.Add((New-Object System.Windows.Setter(
-            [System.Windows.Controls.DataGridRow]::BackgroundProperty, $selectedBrush)))
-        $selectedTrigger.Setters.Add((New-Object System.Windows.Setter(
-            [System.Windows.Controls.DataGridRow]::ForegroundProperty, $selectedFg)))
-        $rowStyle.Triggers.Add($selectedTrigger)
-
-        $LogDataGrid.ItemContainerStyle = $rowStyle
-    } catch {
-        Report-Error "Set-GuiFromConfig" "Failed to apply UI styles: $_" -ShowDialog
-    }
-}
-
-#endregion
-
-#region --- Detail Panel Formatter ---
-
-function Format-LogDetails {
-    param([string]$RawMsg)
-    $msg = $RawMsg
-    if ($script:Config.FormatJson) {
-        $trimMsg = $msg.TrimStart()
-        if ($trimMsg.Length -lt $script:MaxJsonFormatLength -and ($trimMsg.StartsWith("{") -or $trimMsg.StartsWith("["))) {
-            try {
-                $msg = ($msg | ConvertFrom-Json -ErrorAction Stop | ConvertTo-Json -Depth $script:JsonFormatDepth)
-            } catch {
-                Report-Error "Format-LogDetails" "JSON formatting skipped: $_"
-            }
-        }
-    }
-    if ($script:Config.SplitComma)  { $msg = $msg.Replace(',', ",`r`n") }
-    if ($script:Config.SplitSpace)  { $msg = $msg.Replace(' ', " `r`n") }
-    if ($script:Config.SplitPeriod) { $msg = $msg.Replace('.', ".`r`n") }
-    foreach ($d in $script:Config.CustomDelimiters) {
-        if (-not [string]::IsNullOrWhiteSpace($d)) {
-            $msg = $msg.Replace($d, "$d`r`n")
-        }
-    }
-    return $msg
-}
-
-#endregion
-
-#region --- Master List Trim ---
-
-function Invoke-TrimMasterList {
-    $masterList = $script:State.MasterList
-    if ($masterList.Count -gt $script:TrimThreshold) {
-        $excess = $masterList.Count - $script:MaxRetainedEntries
-        $masterList.RemoveRange(0, $excess)
-        Invoke-ApplyFilter
-        return $true
-    }
-    return $false
-}
-
-#endregion
-
-#region --- Initial Setup ---
-
-$LogDataGrid.ItemsSource = $script:State.DisplayCollection
-Set-GuiFromConfig
-Invoke-RebuildFilterBar
-
-#endregion
-
-#region --- Overlay Button ---
-
-$OpenLogOverlayBtn.Add_Click({
-    $OpenMenu.RaiseEvent(
-        (New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.MenuItem]::ClickEvent)))
-})
-
-#endregion
-
-#region --- Slow Scroll ---
-
-Add-SlowScroll $LogDataGrid
-Add-SlowScroll $DetailTextBox
-
-#endregion
-
-#region --- Toolbar Event Handlers ---
-
-$PauseBtn.Add_Click({
-    if ($PauseBtn.IsChecked) {
-        $PauseBtn.Content = "Resume Auto-Refresh"
-        Stop-LogTailing
-    } else {
-        $PauseBtn.Content = "Pause Auto-Refresh"
-        if ($null -ne $script:State.CurrentLogFile) {
-            Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $false
-        }
-    }
-    Update-StatusBar -Force
-})
-
-$ScrollBtn.Add_Click({
-    $ScrollBtn.Content = if ($ScrollBtn.IsChecked) { "Auto-Scroll: ON" } else { "Auto-Scroll: OFF" }
-})
-
-#endregion
-
-#region --- DataGrid Selection ---
-
-$LogDataGrid.Add_SelectionChanged({
-    if ($null -ne $LogDataGrid.SelectedItem) {
-        $DetailTextBox.Text = Format-LogDetails -RawMsg $LogDataGrid.SelectedItem.RawMsg
-    }
-})
-
-#endregion
-
-#region --- Context Menu ---
-
-$ContextCopyMenu.Add_Click({
-    $selectedItems = $LogDataGrid.SelectedItems
-    if ($selectedItems.Count -gt 0) {
-        $lines = New-Object System.Collections.Generic.List[string]
-        foreach ($item in $selectedItems) {
-            if ($null -ne $item) { $lines.Add($item.Message) }
-        }
-        Copy-ToClipboard -Text ([string]::Join("`r`n", $lines))
-    }
-})
-
-$CopyDetailBtn.Add_Click({
-    if (-not [string]::IsNullOrWhiteSpace($DetailTextBox.Text)) {
-        Copy-ToClipboard -Text $DetailTextBox.Text
-    }
-})
-
-#endregion
-
-#region --- Keyboard Shortcuts ---
-
-$script:MainWindow.Add_KeyDown({
-    param($sender, $e)
-    $mods = $e.KeyboardDevice.Modifiers
-    $ctrl = [System.Windows.Input.ModifierKeys]::Control
-
-    if ($mods -eq $ctrl) {
-        if ($e.Key -eq [System.Windows.Input.Key]::O) {
-            $e.Handled = $true
-            $OpenMenu.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.MenuItem]::ClickEvent)))
-        } elseif ($e.Key -eq [System.Windows.Input.Key]::F) {
-            $e.Handled = $true
-            $SearchBox.Focus()
-        } elseif ($e.Key -eq [System.Windows.Input.Key]::C) {
-            $e.Handled = $true
-            $selectedItems = $LogDataGrid.SelectedItems
-            if ($selectedItems.Count -gt 0) {
-                $lines = New-Object System.Collections.Generic.List[string]
-                foreach ($item in $selectedItems) {
-                    if ($null -ne $item) { $lines.Add($item.Message) }
+                _tailer = new LogTailer(path, _config.BuildOrderedKeywords(), PollIntervalMs);
+                _tailer.Start();
+                if (_drainTimer != null)
+                {
+                    _drainTimer.Interval = TimeSpan.FromMilliseconds(50);
+                    _drainTimer.Start();
                 }
-                Copy-ToClipboard -Text ([string]::Join("`r`n", $lines))
+                _statsDirty = true;
+                UpdateStatus();
+            }
+            catch (Exception ex)
+            {
+                ErrorLog.Report("OpenLogFile", $"Could not open '{path}': {ex.Message}");
+                _statusText.Text = $"Could not open {path}: {ex.Message}";
             }
         }
-    }
-})
 
-#endregion
-
-#region --- File Menu ---
-
-$OpenMenu.Add_Click({
-    $dlg        = New-Object Microsoft.Win32.OpenFileDialog
-    $dlg.Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*"
-    if ($dlg.ShowDialog() -eq $true) {
-        $script:State.CurrentLogFile    = $dlg.FileName
-        $script:Config.LastLogFile      = $dlg.FileName
-        $script:MainWindow.Title        = "Configuration Manager Trace Log Tool - $($dlg.FileName)"
-        $script:State.MasterList.Clear()
-        $script:State.DisplayCollection.ReplaceAll($null)
-        $script:State.StatsRowCache.Clear()
-        $DetailTextBox.Text             = ""
-        $SearchBox.Text                 = ""
-        $LogDataGrid.SelectedIndex      = -1
-        Invoke-RebuildFilterBar
-        Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $true
-        $OpenLogOverlay.Visibility      = [System.Windows.Visibility]::Collapsed
-        Update-StatusBar -Force
-    }
-})
-
-$ExitMenu.Add_Click({ $script:MainWindow.Close() })
-
-#endregion
-
-#region --- Error Log Dialog ---
-
-$ErrorLogMenu.Add_Click({
-    if ($script:ErrorLog.Count -eq 0) {
-        [System.Windows.MessageBox]::Show(
-            "No operational errors have been recorded in this session.",
-            "Error Log",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Information) | Out-Null
-        return
-    }
-
-    $errXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="Operational Error Log" Height="400" Width="700"
-        WindowStartupLocation="CenterOwner" Background="#FFF4F4F4" ResizeMode="CanResize">
-    <Grid Margin="5">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBox Grid.Row="0" Name="ErrorText" IsReadOnly="True" Background="White"
-                 FontFamily="Consolas" FontSize="11"
-                 VerticalScrollBarVisibility="Auto"
-                 HorizontalScrollBarVisibility="Auto"
-                 TextWrapping="NoWrap" Padding="4"/>
-        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
-            <Button Name="ClearErrBtn" Content="Clear Log" Width="80" Margin="0,0,5,0"/>
-            <Button Name="CloseErrBtn" Content="Close"     Width="70" IsCancel="True"/>
-        </StackPanel>
-    </Grid>
-</Window>
-"@
-    $errWindow = New-XamlWindow -XamlText $errXaml -Context "Error Log window"
-    if ($null -eq $errWindow) { return }
-    try {
-        $errWindow.Owner = $script:MainWindow
-        $errText     = Get-RequiredNamedControl $errWindow "ErrorText"   "Error Log window"
-        $clearErrBtn = Get-RequiredNamedControl $errWindow "ClearErrBtn" "Error Log window"
-        $closeErrBtn = Get-RequiredNamedControl $errWindow "CloseErrBtn" "Error Log window"
-    } catch {
-        Report-Error "ErrorLogMenu" "Could not resolve controls: $_"
-        return
-    }
-
-    $errText.Text = $script:ErrorLog -join "`r`n"
-    $clearErrBtn.Add_Click({
-        $script:ErrorLog.Clear()
-        $errText.Text = ""
-    })
-    $closeErrBtn.Add_Click({ $errWindow.Close() })
-    [void]$errWindow.ShowDialog()
-})
-
-#endregion
-
-#region --- Search ---
-
-function Find-NextMatch {
-    $searchText = $SearchBox.Text
-    if ([string]::IsNullOrWhiteSpace($searchText)) { return }
-
-    if (-not $PauseBtn.IsChecked) {
-        $script:State.WasTailingBeforeSearch = $true
-        $PauseBtn.IsChecked = $true
-        $PauseBtn.Content   = "Resume Auto-Refresh"
-        Stop-LogTailing
-        if (-not $script:MainWindow.Title.EndsWith($script:SearchPausedSuffix)) {
-            $script:MainWindow.Title = $script:MainWindow.Title + $script:SearchPausedSuffix
+        private async Task PickAndOpenFileAsync()
+        {
+            try
+            {
+                var options = new FilePickerOpenOptions
+                {
+                    Title = "Open log file",
+                    AllowMultiple = false,
+                    FileTypeFilter = new[]
+                    {
+                        new FilePickerFileType("Log files") { Patterns = new[] { "*.log", "*.txt" } },
+                        new FilePickerFileType("All files") { Patterns = new[] { "*" } },
+                    },
+                };
+                var files = await StorageProvider.OpenFilePickerAsync(options);
+                if (files.Count > 0)
+                {
+                    string path = files[0].Path.LocalPath;
+                    if (!string.IsNullOrEmpty(path)) OpenLogFile(path);
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorLog.Report("OpenFilePicker", ex.Message);
+            }
         }
-    }
 
-    if ($ScrollBtn.IsChecked) {
-        $ScrollBtn.IsChecked = $false
-        $ScrollBtn.Content   = "Auto-Scroll: OFF"
-    }
+        // ------------------------------------------------------------------
+        // Remote open: File, Open Remote asks for a computer name and a
+        // path on that computer and builds a UNC path (\\computer\path).
+        // The result goes through the same OpenLogFile path as a local
+        // file, so the FileShare.ReadWrite tailer, filters, and stats
+        // behave identically over SMB. Typing a full UNC path into the
+        // dialog works too: RemoteLogPath.Build passes it through.
+        // ------------------------------------------------------------------
 
-    $displayCollection = $script:State.DisplayCollection
-    if ($null -eq $displayCollection -or $displayCollection.Count -eq 0) { return }
-
-    $startIndex = $LogDataGrid.SelectedIndex + 1
-    if ($startIndex -ge $displayCollection.Count -or $startIndex -lt 0) { $startIndex = 0 }
-
-    $script:MainWindow.Cursor = [System.Windows.Input.Cursors]::Wait
-    try {
-        $idx = [LogParser]::FindNext($displayCollection, $searchText, $startIndex)
-        if ($idx -ge 0) {
-            $LogDataGrid.SelectedIndex = $idx
-            $LogDataGrid.ScrollIntoView($displayCollection[$idx])
-            $LogDataGrid.Focus()
+        private async Task ShowRemoteOpenAsync()
+        {
+            try
+            {
+                var dialog = new RemoteOpenWindow();
+                string? unc = await dialog.ShowDialog<string?>(this);
+                if (!string.IsNullOrEmpty(unc)) OpenLogFile(unc);
+            }
+            catch (Exception ex)
+            {
+                ErrorLog.Report("OpenRemote", ex.Message);
+                _statusText.Text = $"Could not open remote log: {ex.Message}";
+            }
         }
-    } finally {
-        $script:MainWindow.Cursor = $null
+
+        private void StopTailing()
+        {
+            _drainTimer?.Stop();
+            _tailer?.Dispose();
+            _tailer = null;
+        }
+
+        // ------------------------------------------------------------------
+        // Tailing drain: move parsed entries from the tailer queue into
+        // the master list in bounded batches, mirroring the original
+        // viewer's MaxDrainPerTick behaviour.
+        // ------------------------------------------------------------------
+
+        private void OnDrainTick(object? sender, EventArgs e)
+        {
+            if (_tailer == null) return;
+
+            if (!_paused && _tailer.Queue.Count > 0)
+            {
+                var batch = new List<LogEntry>(Math.Min(_tailer.Queue.Count, MaxDrainPerTick));
+                while (batch.Count < MaxDrainPerTick && _tailer.Queue.TryDequeue(out var entry))
+                {
+                    batch.Add(entry);
+                }
+
+                if (batch.Count > 0)
+                {
+                    _master.AddRange(batch);
+                    if (!FilterIsBypass)
+                    {
+                        _display.AddRange(LogParser.FilterEntries(batch, _activeFilter));
+                    }
+                    TrimMasterIfNeeded();
+                    _statsDirty = true;
+                    TrackColumnUsage(batch);
+                    UpdateColumnVisibility();
+
+                    // New lines can change the live search results:
+                    // refresh the count (debounced, like typing)
+                    // without moving the selection.
+                    if (!string.IsNullOrEmpty(_searchBox.Text) && _searchTimer != null)
+                    {
+                        _searchTimer.Stop();
+                        _searchTimer.Start();
+                    }
+
+                    RequestAutoScroll();
+                    UpdateStatus();
+                }
+            }
+
+            if (_initialFlushing && _tailer.InitialLoadComplete && _tailer.Queue.Count == 0)
+            {
+                _initialFlushing = false;
+                _drainTimer!.Interval = TimeSpan.FromMilliseconds(SpeedToIntervalMs(_config.UpdateSpeed));
+                // One final pin to the bottom once the initial load has
+                // fully drained, so a freshly opened log opens at its
+                // newest entry when auto-scroll is on.
+                RequestAutoScroll();
+                // With auto-scroll on, the view sits on the newest
+                // entry: select it too, so the details pane opens
+                // populated on that entry instead of showing its
+                // empty placeholder state over a full pane.
+                SelectLastEntryIfAutoScroll();
+                UpdateStatus();
+            }
+        }
+
+        private void TrackColumnUsage(List<LogEntry> batch)
+        {
+            foreach (var entry in batch)
+            {
+                if (entry.Component.Length > 0) _anyComponent = true;
+                if (entry.Thread.Length > 0) _anyThread = true;
+                if (_anyComponent && _anyThread) break;
+            }
+        }
+
+        // The Component and Thread columns earn their width only when
+        // the loaded file actually carries those values (CMTrace logs
+        // do; plain and bracket-format logs do not, and there the two
+        // empty columns cost roughly 270 px of log text). Visibility
+        // follows the entries seen so far and is re-evaluated as each
+        // batch lands, so a column appears the moment a value for it
+        // shows up.
+        private void UpdateColumnVisibility()
+        {
+            foreach (var column in _logGrid.Columns)
+            {
+                if (column.Header as string == "Component") column.IsVisible = _anyComponent;
+                else if (column.Header as string == "Thread") column.IsVisible = _anyThread;
+            }
+        }
+
+        private void SelectLastEntryIfAutoScroll()
+        {
+            if (_scrollBtn.IsChecked != true) return;
+            var items = CurrentItems();
+            if (items == null || items.Count == 0) return;
+            _logGrid.SelectedItem = items[items.Count - 1];
+        }
+
+        // ------------------------------------------------------------------
+        // Auto-scroll: when the toggle is on, appended entries pin the
+        // view to the last row. The scroll itself is posted to the
+        // dispatcher at Loaded priority so it runs after the grid has
+        // laid out the new rows; calling ScrollIntoView synchronously
+        // from the drain raced layout and virtualisation and left the
+        // viewport parked on older rows while the file kept growing.
+        // Requests coalesce: at most one posted scroll is outstanding.
+        // With the toggle on, new data always returns the view to the
+        // bottom even if the user scrolled up meanwhile (CMTrace
+        // behaviour); with it off, appends never move the viewport.
+        // Scrolling does not change the selection, so it never fights
+        // the details pane.
+        // ------------------------------------------------------------------
+
+        private bool _autoScrollPending;
+
+        private void RequestAutoScroll()
+        {
+            if (_scrollBtn.IsChecked != true || _autoScrollPending) return;
+            _autoScrollPending = true;
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (_scrollBtn.IsChecked == true) ScrollToEnd();
+                // Second pass once the first scroll has laid out the
+                // tail rows, so the pin lands exactly on the bottom
+                // even when the first pass worked from estimated
+                // positions.
+                Dispatcher.UIThread.Post(() =>
+                {
+                    _autoScrollPending = false;
+                    if (_scrollBtn.IsChecked == true) ScrollToEnd();
+                }, DispatcherPriority.Loaded);
+            }, DispatcherPriority.Loaded);
+        }
+
+        private void ScrollToEnd()
+        {
+            var items = CurrentItems();
+            if (items == null || items.Count == 0) return;
+            // Realise the last row first (the grid virtualises, so it
+            // may not exist yet), then drive the grid's own vertical
+            // scroll bar to its maximum: ScrollIntoView alone can stop
+            // short when it runs before the final layout pass. The
+            // DataGrid template has no ScrollViewer; its scroll bar is
+            // the scroll state.
+            _logGrid.ScrollIntoView(items[items.Count - 1], null);
+            var bar = _logGrid.GetVisualDescendants().OfType<ScrollBar>()
+                .FirstOrDefault(sb => sb.Name == "PART_VerticalScrollbar");
+            if (bar != null && bar.Maximum > 0 && bar.Value < bar.Maximum)
+            {
+                bar.Value = bar.Maximum;
+            }
+        }
+
+        private static int SpeedToIntervalMs(int speed)
+        {
+            switch (Math.Clamp(speed, 1, 5))
+            {
+                case 1: return 500;
+                case 2: return 250;
+                case 3: return 100;
+                case 4: return 50;
+                default: return 25;
+            }
+        }
+
+        private void TrimMasterIfNeeded()
+        {
+            if (_master.Count <= TrimThreshold) return;
+            int excess = _master.Count - MaxRetainedEntries;
+            var remaining = _master.Skip(excess).ToList();
+            _master.ReplaceAll(remaining);
+            ApplyFilter();
+            ErrorLog.Report("TrimMasterList", $"Trimmed {excess} oldest entries at the {MaxRetainedEntries} retention cap.");
+        }
+
+        // ------------------------------------------------------------------
+        // Filtering
+        // ------------------------------------------------------------------
+
+        private bool FilterIsBypass => _activeFilter.Values.All(v => v);
+
+        private void RebuildFilterBar()
+        {
+            _filterPanel.Children.Clear();
+            _chips.Clear();
+
+            var allBtn = new Button { Content = "All", Margin = new Thickness(0, 0, 6, 0), Padding = new Thickness(10, 3, 10, 3), CornerRadius = new CornerRadius(6), FontSize = 12, HorizontalContentAlignment = Avalonia.Layout.HorizontalAlignment.Center, VerticalContentAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            allBtn.Click += (_, _) => ClearExclusiveFilter();
+            _filterPanel.Children.Add(allBtn);
+
+            var levels = new List<string>();
+            foreach (var kv in _config.BuildOrderedKeywords())
+            {
+                if (!levels.Contains(kv.Key, StringComparer.OrdinalIgnoreCase)) levels.Add(kv.Key);
+            }
+            foreach (string extra in new[] { LogLevels.Error, LogLevels.Warning, LogLevels.Info, LogLevels.Verbose })
+            {
+                if (!levels.Contains(extra, StringComparer.OrdinalIgnoreCase)) levels.Add(extra);
+            }
+            foreach (var entry in _master)
+            {
+                if (!levels.Contains(entry.Level, StringComparer.OrdinalIgnoreCase)) levels.Add(entry.Level);
+            }
+
+            foreach (string level in levels)
+            {
+                if (!_activeFilter.ContainsKey(level)) _activeFilter[level] = true;
+                var chip = new ToggleButton
+                {
+                    Content = level,
+                    Tag = level,
+                    IsChecked = _activeFilter[level],
+                };
+                chip.Classes.Add("chip");
+                StyleChip(chip, level);
+                chip.IsCheckedChanged += (_, _) =>
+                {
+                    _activeFilter[level] = chip.IsChecked == true;
+                    StyleChip(chip, level);
+                    // While the statistics panel or the Clear filter
+                    // button is driving the chips, the batch applies
+                    // the filter once at the end, not per chip.
+                    if (!_syncingFilter) ApplyFilter();
+                };
+                _chips[level] = chip;
+                _filterPanel.Children.Add(chip);
+            }
+        }
+
+        // Chip state must read at a glance: an included level is a
+        // filled chip in the level's own palette pair (deep fill,
+        // pale text) with a saturated border; an excluded level is
+        // an unfilled chip a step up from the band colour with
+        // muted but still legible text and a grey outline. (The
+        // App.axaml chip style hands the checked chip's template
+        // presenter back this Background: the Fluent theme would
+        // otherwise paint every checked chip the same accent blue
+        // and hide the state colours entirely.)
+        private void StyleChip(ToggleButton chip, string level)
+        {
+            if (chip.IsChecked == true)
+            {
+                chip.Background = GetBrush(BackgroundHexFor(level));
+                chip.Foreground = GetBrush(TextHexFor(level));
+                chip.BorderBrush = GetBrush(StripeHexFor(level));
+            }
+            else
+            {
+                chip.Background = GetBrush("#FF1E2938");
+                chip.Foreground = GetBrush("#FF8B95A1");
+                chip.BorderBrush = GetBrush("#FF3A4656");
+            }
+            chip.BorderThickness = new Thickness(1);
+        }
+
+        private void ApplyFilter()
+        {
+            if (FilterIsBypass)
+            {
+                if (!ReferenceEquals(_logGrid.ItemsSource, _master)) _logGrid.ItemsSource = _master;
+            }
+            else
+            {
+                var filtered = LogParser.FilterEntries(_master.ToList(), _activeFilter);
+                _display.ReplaceAll(filtered);
+                if (!ReferenceEquals(_logGrid.ItemsSource, _display)) _logGrid.ItemsSource = _display;
+            }
+            SyncExclusiveState();
+            RequestAutoScroll();
+            UpdateStatus();
+        }
+
+        // ------------------------------------------------------------------
+        // Exclusive filter from the statistics panel: clicking a type
+        // row shows ONLY that type. The chips are driven to the same
+        // state (under the sync guard, so the batch applies once),
+        // and the statistics panel highlights the active row. The
+        // Clear filter button under the statistics (and the chips'
+        // All button) restores every type through ClearExclusiveFilter.
+        // SyncExclusiveState keeps the highlight honest when the
+        // chips are used directly: any filter state with exactly one
+        // active level reads as that level's exclusive filter.
+        // ------------------------------------------------------------------
+
+        private void ApplyExclusiveLevelFilter(string level)
+        {
+            _syncingFilter = true;
+            try
+            {
+                foreach (var key in _activeFilter.Keys.ToList())
+                {
+                    _activeFilter[key] = key.Equals(level, StringComparison.OrdinalIgnoreCase);
+                }
+                foreach (var kv in _chips)
+                {
+                    kv.Value.IsChecked = _activeFilter.TryGetValue(kv.Key, out var on) && on;
+                }
+            }
+            finally
+            {
+                _syncingFilter = false;
+            }
+            ApplyFilter();
+        }
+
+        private void ClearExclusiveFilter()
+        {
+            _syncingFilter = true;
+            try
+            {
+                foreach (var key in _activeFilter.Keys.ToList()) _activeFilter[key] = true;
+                foreach (var chip in _chips.Values) chip.IsChecked = true;
+            }
+            finally
+            {
+                _syncingFilter = false;
+            }
+            ApplyFilter();
+        }
+
+        private void SyncExclusiveState()
+        {
+            var active = _activeFilter.Where(kv => kv.Value).Select(kv => kv.Key).ToList();
+            string? exclusive = active.Count == 1 ? active[0] : null;
+            if (!string.Equals(exclusive, _exclusiveLevel, StringComparison.OrdinalIgnoreCase))
+            {
+                _exclusiveLevel = exclusive;
+                RefreshStats();
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Row styling: the active theme's palette background and
+        // foreground per level, applied as rows are realised so recycled rows always
+        // repaint. A selected row switches to the solid dark selection
+        // background with white text, set here as local values: the
+        // row template's border paints the row's Background, so this
+        // is the layer that actually renders, and setting it in code
+        // also stops a severity background realised earlier from
+        // showing through (App.axaml carries the same colours in its
+        // :selected styles for rows this pass has not reached). The
+        // severity signal survives selection as a saturated stripe in
+        // the row's left border, so a selected Error or Warn row is
+        // still identifiable at a glance and stays readable, unlike
+        // the old translucent accent wash over severity-coloured text.
+        // ------------------------------------------------------------------
+
+        private const string SelectionBackgroundHex = "#FF1C58D9";
+
+        private void OnGridLoadingRow(object? sender, DataGridRowEventArgs e)
+        {
+            StyleRow(e.Row);
+        }
+
+        private void StyleRow(DataGridRow row)
+        {
+            if (row.DataContext is not LogEntry entry) return;
+            bool selected = _logGrid.SelectedItems.Contains(entry);
+            row.BorderBrush = GetBrush(StripeHexFor(entry.Level));
+            row.BorderThickness = new Thickness(3, 0, 0, 0);
+            if (selected)
+            {
+                row.Background = GetBrush(SelectionBackgroundHex);
+                row.Foreground = GetBrush("#FFFFFFFF");
+            }
+            else
+            {
+                row.Background = GetBrush(BackgroundHexFor(entry.Level));
+                row.Foreground = GetBrush(TextHexFor(entry.Level));
+            }
+        }
+
+        private void RestyleRealisedRows()
+        {
+            foreach (var row in _logGrid.GetVisualDescendants().OfType<DataGridRow>())
+            {
+                StyleRow(row);
+            }
+        }
+
+        // All three lookups go through the single dark palette: the
+        // colour NAME comes from the keyword map as before, the hex
+        // from the dark map in AppConfig.
+        private string StripeHexFor(string level)
+        {
+            var map = AppConfig.Stripes();
+            if (_config.Keywords.TryGetValue(level, out var colorName) &&
+                map.TryGetValue(colorName, out var hex))
+            {
+                return hex;
+            }
+            return map["White"];
+        }
+
+        private string BackgroundHexFor(string level)
+        {
+            var map = AppConfig.RowBackgrounds();
+            if (_config.Keywords.TryGetValue(level, out var colorName) &&
+                map.TryGetValue(colorName, out var hex))
+            {
+                return hex;
+            }
+            return map["White"];
+        }
+
+        // The statistics swatch for the neutral level (Info, whose
+        // colour name is "White") gets a filled neutral grey: its
+        // row fill is a near-surface dark grey, which reads as an
+        // empty checkbox next to the filled swatches, and a mid
+        // grey reads clearer. The row colours themselves are
+        // unchanged.
+        private string SwatchHexFor(string level)
+        {
+            // 2026 redesign: the statistics dot is the saturated
+            // stripe colour, the same signal the grid rows carry in
+            // their left border, so the two views agree at a glance.
+            return StripeHexFor(level);
+        }
+
+        private string TextHexFor(string level)
+        {
+            // The neutral level (keyword colour White: the Info
+            // bulk of the log) paints in the user's configured text
+            // colour; severity levels keep their palette tints.
+            if (_config.Keywords.TryGetValue(level, out var colorName) &&
+                colorName.Equals("White", StringComparison.OrdinalIgnoreCase))
+            {
+                return _effectiveTextColorHex;
+            }
+            var map = AppConfig.RowForegrounds();
+            if (colorName != null && map.TryGetValue(colorName, out var hex))
+            {
+                return hex;
+            }
+            return map["White"];
+        }
+
+        private IBrush GetBrush(string hex)
+        {
+            if (!_brushCache.TryGetValue(hex, out var brush))
+            {
+                brush = new SolidColorBrush(Color.Parse(hex));
+                _brushCache[hex] = brush;
+            }
+            return brush;
+        }
+
+        private void RefreshRowStyling()
+        {
+            var source = _logGrid.ItemsSource;
+            _logGrid.ItemsSource = null;
+            _logGrid.ItemsSource = source;
+        }
+
+        // ------------------------------------------------------------------
+        // Selection, detail panel, search, copy
+        // ------------------------------------------------------------------
+
+        private void OnGridSelectionChanged(object? sender, SelectionChangedEventArgs e)
+        {
+            UpdateDetailPane(_logGrid.SelectedItem as LogEntry);
+            // Selection is part of row styling (white text and the
+            // severity stripe while selected): repaint the realised
+            // rows so the row that lost selection gets its severity
+            // colours back and the new one switches.
+            RestyleRealisedRows();
+        }
+
+        // The details pane: structured fields for the selected entry
+        // (time, date, type, component, thread, in the CMTrace info
+        // pane style) above the formatted message body. Copy to
+        // Clipboard still copies the body text, as before.
+        private void UpdateDetailPane(LogEntry? entry)
+        {
+            if (entry == null)
+            {
+                _detailTimeText.Text = "-";
+                _detailDateText.Text = "-";
+                _detailTypeText.Text = "-";
+                _detailComponentText.Text = "-";
+                _detailThreadText.Text = "-";
+                _detailText.Text = "";
+                return;
+            }
+            _detailTimeText.Text = OrDash(entry.Time);
+            _detailDateText.Text = OrDash(entry.Date);
+            _detailTypeText.Text = entry.TypeVal is "1" or "2" or "3"
+                ? $"{entry.Level} (type {entry.TypeVal})"
+                : entry.Level;
+            _detailComponentText.Text = OrDash(entry.Component);
+            _detailThreadText.Text = OrDash(entry.Thread);
+            _detailText.Text = DetailFormatter.Format(entry.RawMsg, _config);
+        }
+
+        private static string OrDash(string value) => string.IsNullOrEmpty(value) ? "-" : value;
+
+        private IList<LogEntry>? CurrentItems() => _logGrid.ItemsSource as IList<LogEntry>;
+
+        private void FocusSearch()
+        {
+            _searchBox.Focus();
+            _searchBox.SelectAll();
+        }
+
+        // Search covers the WHOLE list and every shown field (log
+        // text, message, component, thread, type, time), never just
+        // the region below the current row (Brandon, Nov 22). A new
+        // search text always starts from the top of the file; Next
+        // and Previous walk the matches and wrap around the ends:
+        // Next past the last match scrolls back to the top and
+        // continues to the first match, Previous before the first
+        // match wraps to the last.
+        private List<int> CurrentMatchIndices()
+        {
+            var result = new List<int>();
+            var items = CurrentItems();
+            string text = _searchBox.Text ?? "";
+            if (items == null || text.Length == 0) return result;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var e = items[i];
+                if (e.DisplayText.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.RawMsg.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.Message.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.Component.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.Thread.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.Level.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                    e.Time.Contains(text, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(i);
+                }
+            }
+            return result;
+        }
+
+        private void UpdateSearchCount(int matches, bool hasText)
+        {
+            _searchCountText.Text = !hasText ? ""
+                : matches == 0 ? "No matches"
+                : matches == 1 ? "1 match"
+                : $"{matches} matches";
+        }
+
+        private void ApplyLiveSearch()
+        {
+            string text = _searchBox.Text ?? "";
+            if (text.Length == 0)
+            {
+                _lastSearchText = "";
+                UpdateSearchCount(0, false);
+                return;
+            }
+            var matches = CurrentMatchIndices();
+            UpdateSearchCount(matches.Count, true);
+            if (matches.Count == 0) { _lastSearchText = text; return; }
+            var items = CurrentItems()!;
+            // A changed text restarts from the top of the file, so
+            // the first match overall is selected; an unchanged text
+            // (a re-run of the debounce tick) keeps the match at or
+            // after the current row.
+            int target = text != _lastSearchText
+                ? matches[0]
+                : matches.FirstOrDefault(m => m >= _logGrid.SelectedIndex, matches[0]);
+            _lastSearchText = text;
+            _logGrid.SelectedIndex = target;
+            _logGrid.ScrollIntoView(items[target], null);
+        }
+
+        private void DoFind()
+        {
+            var items = CurrentItems();
+            if (items == null || items.Count == 0) return;
+            string text = _searchBox.Text ?? "";
+            if (text.Length == 0) return;
+            var matches = CurrentMatchIndices();
+            UpdateSearchCount(matches.Count, true);
+            if (matches.Count == 0)
+            {
+                _statusText.Text = $"Not found: {text}";
+                return;
+            }
+            // New text: start at the first match in the file. Same
+            // text: the next match after the current row, wrapping
+            // past the end back to the top of the file.
+            int target = text != _lastSearchText
+                ? matches[0]
+                : matches.FirstOrDefault(m => m > _logGrid.SelectedIndex, matches[0]);
+            _lastSearchText = text;
+            _logGrid.SelectedIndex = target;
+            _logGrid.ScrollIntoView(items[target], null);
+        }
+
+        private void DoFindPrevious()
+        {
+            var items = CurrentItems();
+            if (items == null || items.Count == 0) return;
+            string text = _searchBox.Text ?? "";
+            if (text.Length == 0) return;
+            var matches = CurrentMatchIndices();
+            UpdateSearchCount(matches.Count, true);
+            if (matches.Count == 0)
+            {
+                _statusText.Text = $"Not found: {text}";
+                return;
+            }
+            // New text: start at the last match in the file. Same
+            // text: the previous match before the current row,
+            // wrapping past the top back to the last match.
+            int target = text != _lastSearchText
+                ? matches[matches.Count - 1]
+                : matches.LastOrDefault(m => m < _logGrid.SelectedIndex, matches[matches.Count - 1]);
+            _lastSearchText = text;
+            _logGrid.SelectedIndex = target;
+            _logGrid.ScrollIntoView(items[target], null);
+        }
+
+        private async Task CopySelectedRowsAsync()
+        {
+            var selected = _logGrid.SelectedItems.OfType<LogEntry>().ToList();
+            if (selected.Count == 0 && _logGrid.SelectedItem is LogEntry single) selected.Add(single);
+            if (selected.Count == 0) return;
+            var sb = new StringBuilder();
+            foreach (var entry in selected) sb.AppendLine(entry.Message);
+            await CopyTextAsync(sb.ToString());
+        }
+
+        // Every loaded log line, filter or no filter: the text the
+        // Copy All toolbar button puts on the clipboard.
+        private string AllLogText()
+        {
+            var sb = new StringBuilder();
+            foreach (var entry in _master) sb.AppendLine(entry.Message);
+            return sb.ToString();
+        }
+
+        private async Task CopyAllLogsAsync()
+        {
+            if (_master.Count == 0) return;
+            await CopyTextAsync(AllLogText());
+            _statusText.Text = $"Copied {_master.Count} log lines to the clipboard.";
+        }
+
+        private async Task CopyTextAsync(string text)
+        {
+            try
+            {
+                var topLevel = TopLevel.GetTopLevel(this);
+                if (topLevel?.Clipboard != null) await topLevel.Clipboard.SetTextAsync(text);
+            }
+            catch (Exception ex)
+            {
+                ErrorLog.Report("Copy-ToClipboard", ex.Message);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Statistics panel
+        // ------------------------------------------------------------------
+
+        private void SetStatsSort(string column)
+        {
+            if (_config.StatsSortColumn == column)
+            {
+                _config.StatsSortDirection = _config.StatsSortDirection == "Ascending" ? "Descending" : "Ascending";
+            }
+            else
+            {
+                _config.StatsSortColumn = column;
+                _config.StatsSortDirection = "Ascending";
+            }
+            UpdateSortButtonLabels();
+            RefreshStats();
+        }
+
+        private void UpdateSortButtonLabels()
+        {
+            // ASCII only: the previous build used unicode triangle glyphs
+            // here, which rendered as garbled characters on Windows.
+            string Arrow(string col) => _config.StatsSortColumn == col
+                ? (_config.StatsSortDirection == "Ascending" ? " ^" : " v")
+                : "";
+            _sortTypeBtn.Content = "Type" + Arrow("Type");
+            _sortCountBtn.Content = "Count" + Arrow("Count");
+            _sortPctBtn.Content = "%" + Arrow("Percentage");
+        }
+
+        private void RefreshStats()
+        {
+            var stats = LogParser.GetLevelStatistics(_master);
+            bool desc = _config.StatsSortDirection == "Descending";
+            switch (_config.StatsSortColumn)
+            {
+                case "Count":
+                    stats.Sort((a, b) => desc ? b.Count.CompareTo(a.Count) : a.Count.CompareTo(b.Count));
+                    break;
+                case "Percentage":
+                    stats.Sort((a, b) => desc ? b.Percentage.CompareTo(a.Percentage) : a.Percentage.CompareTo(b.Percentage));
+                    break;
+                default:
+                    stats.Sort((a, b) => desc
+                        ? string.Compare(b.Level, a.Level, StringComparison.OrdinalIgnoreCase)
+                        : string.Compare(a.Level, b.Level, StringComparison.OrdinalIgnoreCase));
+                    break;
+            }
+
+            _statsPanel.Children.Clear();
+            foreach (var row in stats)
+            {
+                var grid = new Grid
+                {
+                    ColumnDefinitions = new ColumnDefinitions("*,56,54"),
+                    Margin = new Thickness(12, 4, 12, 4),
+                    // Transparent, not null: a null background is not
+                    // hit-testable, which made only the row's text and
+                    // swatch clickable instead of the whole row.
+                    Background = Brushes.Transparent,
+                };
+                var namePanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8 };
+                namePanel.Children.Add(new Border
+                {
+                    Width = 8,
+                    Height = 8,
+                    CornerRadius = new CornerRadius(4),
+                    VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center,
+                    Background = GetBrush(SwatchHexFor(row.Level)),
+                });
+                namePanel.Children.Add(new TextBlock { Text = row.Level, FontSize = 12, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center });
+                grid.Children.Add(namePanel);
+
+                var countText = new TextBlock { Text = row.Count.ToString("N0"), FontSize = 12, TextAlignment = TextAlignment.Right, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+                Grid.SetColumn(countText, 1);
+                grid.Children.Add(countText);
+
+                var pctText = new TextBlock { Text = row.Percentage.ToString("0.0") + "%", FontSize = 12, TextAlignment = TextAlignment.Right, Foreground = GetBrush("#FF9BA3AC"), VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+                Grid.SetColumn(pctText, 2);
+                grid.Children.Add(pctText);
+
+                // The whole row is a click target: clicking a type
+                // filters the grid to only that type (see
+                // ApplyExclusiveLevelFilter), so it carries the hand
+                // cursor and a tooltip, and while its filter is the
+                // active one the row is highlighted with the accent
+                // edge and a raised panel fill.
+                bool isExclusive = _exclusiveLevel != null &&
+                    _exclusiveLevel.Equals(row.Level, StringComparison.OrdinalIgnoreCase);
+                var rowBorder = new Border
+                {
+                    BorderBrush = isExclusive ? GetBrush("#FF1C58D9") : GetBrush("#FF2A3644"),
+                    BorderThickness = isExclusive ? new Thickness(3, 0, 0, 1) : new Thickness(0, 0, 0, 1),
+                    // The whole row is the click target (Brandon,
+                    // Nov 22): the border must carry a background or
+                    // the empty parts of the row never see the press.
+                    Background = isExclusive ? GetBrush("#FF24344A") : Brushes.Transparent,
+                    Cursor = new Cursor(StandardCursorType.Hand),
+                    Tag = row.Level,
+                    Child = grid,
+                };
+                ToolTip.SetTip(rowBorder, $"Show only {row.Level}");
+                string level = row.Level;
+                rowBorder.PointerPressed += (_, e) =>
+                {
+                    if (e.GetCurrentPoint(rowBorder).Properties.IsLeftButtonPressed)
+                    {
+                        ApplyExclusiveLevelFilter(level);
+                    }
+                };
+                _statsPanel.Children.Add(rowBorder);
+            }
+            _totalCountText.Text = _master.Count.ToString("N0");
+        }
+
+        // ------------------------------------------------------------------
+        // Settings
+        // ------------------------------------------------------------------
+
+        private async Task ShowSettingsAsync()
+        {
+            string keywordsBefore = SerializeKeywords(_config.Keywords);
+            var settings = new SettingsWindow(_config);
+            settings.PreviewChanged += ApplySettingsPreview;
+            await settings.ShowDialog(this);
+            if (!settings.Accepted)
+            {
+                // Revert any live preview to the saved config.
+                ApplyFontSettings();
+                ApplyUiScale();
+                RestyleRealisedRows();
+                UpdateDetailPane(_logGrid.SelectedItem as LogEntry);
+                return;
+            }
+
+            _config.Save();
+            ApplyFontSettings();
+            ApplyUiScale();
+            RestyleRealisedRows();
+
+            bool keywordsChanged = SerializeKeywords(_config.Keywords) != keywordsBefore;
+            if (keywordsChanged)
+            {
+                RebuildFilterBar();
+                if (_currentFile != null)
+                {
+                    // Re-parse from scratch so existing rows and the tailer
+                    // both use the new keyword set, like the original's
+                    // re-evaluation plus tail restart.
+                    string file = _currentFile;
+                    OpenLogFile(file);
+                }
+                else
+                {
+                    LogParser.ReEvaluateAll(_master.ToList(), _config.BuildOrderedKeywords());
+                    ApplyFilter();
+                    RefreshRowStyling();
+                }
+            }
+            else if (_drainTimer != null && !_initialFlushing)
+            {
+                _drainTimer.Interval = TimeSpan.FromMilliseconds(SpeedToIntervalMs(_config.UpdateSpeed));
+            }
+            UpdateDetailPane(_logGrid.SelectedItem as LogEntry);
+            _statsDirty = true;
+        }
+
+        private static string SerializeKeywords(Dictionary<string, string> keywords) =>
+            string.Join("|", keywords.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                                      .Select(kv => kv.Key + "=" + kv.Value));
+
+        private void ApplyFontSettings()
+        {
+            _effectiveTextColorHex = _config.TextColorHex();
+            var family = new FontFamily(_config.FontFamily);
+            TextElement.SetFontFamily(_logGrid, family);
+            TextElement.SetFontSize(_logGrid, _config.FontSize);
+            _detailText.FontFamily = family;
+            _detailText.FontSize = _config.FontSize;
+            _detailText.Foreground = GetBrush(_effectiveTextColorHex);
+        }
+
+        // Live preview from the Settings dialog: the visual
+        // settings are applied to this window as the user adjusts
+        // them, without touching the saved config. Accepting the
+        // dialog saves and reapplies from the config; cancelling
+        // reapplies from the config, which reverts the preview.
+        private void ApplySettingsPreview(SettingsPreview preview)
+        {
+            _rootScale.LayoutTransform = new ScaleTransform(preview.UiScale, preview.UiScale);
+            _effectiveTextColorHex = preview.TextColorHex;
+            var family = new FontFamily(preview.FontFamily);
+            TextElement.SetFontFamily(_logGrid, family);
+            TextElement.SetFontSize(_logGrid, preview.FontSize);
+            _detailText.FontFamily = family;
+            _detailText.FontSize = preview.FontSize;
+            _detailText.Foreground = GetBrush(preview.TextColorHex);
+            RestyleRealisedRows();
+        }
+
+        // The Settings UI scale, applied as a layout transform on
+        // the window's root so every control, font and spacing
+        // scales together (a layout transform, not a render zoom,
+        // so nothing clips at the window edges).
+        private void ApplyUiScale()
+        {
+            _rootScale.LayoutTransform = new ScaleTransform(_config.UiScale, _config.UiScale);
+        }
+
+        // ------------------------------------------------------------------
+        // Status, layout persistence, shutdown
+        // ------------------------------------------------------------------
+
+        private void UpdateStatus()
+        {
+            if (_currentFile == null)
+            {
+                _statusText.Text = "No log file open.";
+                return;
+            }
+            var items = CurrentItems();
+            int shown = items?.Count ?? 0;
+            string state = _tailer == null ? "Stopped" : (_paused ? "Paused" : (_initialFlushing ? "Loading" : "Tailing"));
+            string text = $"{_currentFile} | {_master.Count:N0} lines | {shown:N0} shown | {state}";
+            // Surface tailer trouble (unreachable remote host, access
+            // denied, IO errors) in the status bar itself, not only in
+            // the error log window: a remote open that cannot reach its
+            // file must never look like a silent empty log.
+            string? tailError = _tailer?.LastError;
+            if (!string.IsNullOrEmpty(tailError)) text += $" | {tailError}";
+            _statusText.Text = text;
+        }
+
+        private void ShowTailErrorIfNew()
+        {
+            string? err = _tailer?.LastError;
+            if (err != null && err != _lastShownTailError)
+            {
+                _lastShownTailError = err;
+                ErrorLog.Report("LogTailer", err);
+                UpdateStatus();
+            }
+        }
+
+        private void SetDetailRowHeight(double height)
+        {
+            // Row 4 of the left grid is the details pane (menu strip,
+            // filter band, log grid, splitter, details, status bar).
+            _leftGrid.RowDefinitions[4].Height = new GridLength(Math.Max(80, height));
+        }
+
+        private double GetDetailRowHeight()
+        {
+            return _leftGrid.RowDefinitions[4].ActualHeight;
+        }
+
+        private void OnWindowClosed(object? sender, EventArgs e)
+        {
+            StopTailing();
+            _statsTimer?.Stop();
+            _config.WindowWidth = Width;
+            _config.WindowHeight = Height;
+            double detail = GetDetailRowHeight();
+            if (detail >= 80) _config.BottomPanelHeight = detail;
+            _config.Save();
+        }
     }
 }
-
-$SearchBtn.Add_Click({ Find-NextMatch })
-
-$SearchBox.Add_KeyDown({
-    param($sender, $e)
-    if ($e.Key -eq 'Return' -or $e.Key -eq 'Enter') {
-        $e.Handled = $true
-        Find-NextMatch
-    }
-})
-
-$ClearSearchBtn.Add_Click({
-    $SearchBox.Text            = ""
-    $LogDataGrid.SelectedIndex = -1
-    $DetailTextBox.Text        = ""
-    $SearchBox.Focus()
-    if ($script:MainWindow.Title.EndsWith($script:SearchPausedSuffix)) {
-        $script:MainWindow.Title = $script:MainWindow.Title.Substring(
-            0, $script:MainWindow.Title.Length - $script:SearchPausedSuffix.Length)
-        
-        if ($script:State.WasTailingBeforeSearch) {
-            $PauseBtn.IsChecked = $false
-            $PauseBtn.Content   = "Pause Auto-Refresh"
-            if ($null -ne $script:State.CurrentLogFile) {
-                Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $false
-            }
-            $script:State.WasTailingBeforeSearch = $false
-        }
-    }
-})
-
-$FindMenu.Add_Click({ $SearchBox.Focus() })
-
-#endregion
-
-#region --- Window Closing ---
-
-$script:MainWindow.Add_Closing({
-    try {
-        if ($null -ne $script:FilterDebounceTimer) { $script:FilterDebounceTimer.Stop() }
-        if ($null -ne $script:RefreshTimer)        { $script:RefreshTimer.Stop() }
-        Stop-LogTailing
-        if ($null -ne $BottomRow) {
-            $script:Config.BottomPanelHeight = [int]$BottomRow.Height.Value
-        }
-        $script:Config.WindowWidth  = [Math]::Max($script:MinWindowWidth,  [Math]::Min($script:MaxWindowWidth,  [int]$script:MainWindow.Width))
-        $script:Config.WindowHeight = [Math]::Max($script:MinWindowHeight, [Math]::Min($script:MaxWindowHeight, [int]$script:MainWindow.Height))
-        Export-Config
-    } catch {
-        Report-Error "Window.Closing" "$_"
-    }
-    if ($script:ErrorLog.Count -gt 0) {
-        Write-Host "`n--- Operational Error Log ---" -ForegroundColor Yellow
-        foreach ($entry in $script:ErrorLog) { Write-Host $entry -ForegroundColor Red }
-    }
-})
-
-#endregion
-
-#region --- Settings Dialog ---
-
-$SettingsMenu.Add_Click({
-    $settingsXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+'@
+ $settingsAxaml=@'
+<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:sys="clr-namespace:System;assembly=mscorlib"
-        Title="Settings" Height="680" Width="450" FontSize="11"
-        WindowStartupLocation="CenterOwner" Background="#FFF4F4F4" ResizeMode="CanResize">
-    <Window.Resources>
-        <x:Array x:Key="ColorList" Type="sys:String">
-            <sys:String>Red</sys:String>
-            <sys:String>Orange</sys:String>
-            <sys:String>Yellow</sys:String>
-            <sys:String>Green</sys:String>
-            <sys:String>Blue</sys:String>
-            <sys:String>Purple</sys:String>
-            <sys:String>White</sys:String>
-        </x:Array>
-    </Window.Resources>
-    <Grid Margin="5">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <GroupBox Header=" General Settings " Grid.Row="0" Margin="0,0,0,5" Padding="3">
-            <Grid Margin="2">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <TextBlock Text="Font Family:" Grid.Column="0" VerticalAlignment="Center" Margin="2"/>
-                <ComboBox  Name="FontCombo"    Grid.Column="1" Margin="2"/>
-                <TextBlock Text="Size:"        Grid.Column="2" Margin="5,0,2,0" VerticalAlignment="Center"/>
-                <ComboBox  Name="SizeCombo"    Grid.Column="3" Width="40" Margin="2"/>
-                <TextBlock Text="Speed (s):"   Grid.Column="4" Margin="5,0,2,0" VerticalAlignment="Center"/>
-                <ComboBox  Name="SpeedCombo"   Grid.Column="5" Width="40" Margin="2"/>
-            </Grid>
-        </GroupBox>
-        <GroupBox Header=" Detail Panel Formatting " Grid.Row="1" Margin="0,0,0,5" Padding="3">
-            <WrapPanel Margin="2">
-                <CheckBox Name="JsonCheck"   Content="Format JSON"   Margin="2"/>
-                <CheckBox Name="CommaCheck"  Content="Split Commas"  Margin="2"/>
-                <CheckBox Name="SpaceCheck"  Content="Split Spaces"  Margin="2"/>
-                <CheckBox Name="PeriodCheck" Content="Split Periods" Margin="2"/>
-            </WrapPanel>
-        </GroupBox>
-        <GroupBox Header=" Custom Delimiters " Grid.Row="2" Margin="0,0,0,5" Padding="3">
-            <Grid Margin="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="80"/>
-                </Grid.RowDefinitions>
-                <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="2">
-                    <TextBlock Text="Delimiter:"     VerticalAlignment="Center" Margin="2"/>
-                    <TextBox   Name="NewDelim"       Width="60"  Margin="2"/>
-                    <Button    Name="AddDelimBtn"    Content="Add"             Width="50"  Margin="2"/>
-                    <Button    Name="RemoveDelimBtn" Content="Remove Selected" Width="100" Margin="2"/>
-                </StackPanel>
-                <ListBox Name="DelimList" Grid.Row="1" Margin="2" ScrollViewer.CanContentScroll="False"/>
-            </Grid>
-        </GroupBox>
-        <GroupBox Header=" Keyword Highlighting " Grid.Row="3" Margin="0,0,0,5" Padding="3">
-            <Grid Margin="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="*"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-                <DataGrid Name="KeywordsGrid" Grid.Row="0"
-                          AutoGenerateColumns="False" HeadersVisibility="Column"
-                          CanUserAddRows="True" CanUserDeleteRows="True"
-                          Margin="2" VirtualizingPanel.ScrollUnit="Pixel">
-                    <DataGrid.Columns>
-                        <DataGridTextColumn Header="Keyword" Binding="{Binding Key}" Width="*" IsReadOnly="False"/>
-                        <DataGridTemplateColumn Header="Color" Width="100">
-                            <DataGridTemplateColumn.CellTemplate>
-                                <DataTemplate>
-                                    <ComboBox SelectedItem="{Binding Value, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                              ItemsSource="{StaticResource ColorList}" Margin="1"/>
-                                </DataTemplate>
-                            </DataGridTemplateColumn.CellTemplate>
-                        </DataGridTemplateColumn>
-                    </DataGrid.Columns>
-                </DataGrid>
-                <Button Name="RemoveBtn" Content="Remove Selected" Grid.Row="1" Width="100" HorizontalAlignment="Left" Margin="2"/>
-            </Grid>
-        </GroupBox>
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Grid.Row="4" Margin="5,2,0,2">
-            <Button Name="SaveBtn"   Content="Save and Apply" Width="90" Margin="0,0,5,0" IsDefault="True"/>
-            <Button Name="CancelBtn" Content="Cancel"         Width="70" IsCancel="True"/>
-        </StackPanel>
+        xmlns:local="using:__APPNAME__"
+        x:Class="__APPNAME__.SettingsWindow"
+        Title="PSTrace Settings"
+        Width="680" Height="720" MinWidth="560" MinHeight="600"
+        FontSize="12"
+        FontFamily="Segoe UI, Inter, DejaVu Sans, sans-serif"
+        RequestedThemeVariant="Dark"
+        Background="{DynamicResource PSTraceSurfaceBg}"
+        Foreground="{DynamicResource PSTraceText}"
+        WindowStartupLocation="CenterOwner">
+  <!-- The dialog follows the app theme (dark variant pinned here
+       as on the main window, chrome painted with the shared
+       PSTrace brushes) and the configured UI scale, like every
+       other window. -->
+  <LayoutTransformControl Name="SettingsScale">
+  <!-- Every row is Auto and the keyword grid carries a fixed
+       height: nothing in this dialog stretches with the window, so
+       the content's desired size is constant and resizing the
+       dialog can never feed back into a bigger desired size. -->
+  <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto" Margin="16">
+    <TextBlock Grid.Row="0" Text="Highlighting keywords" Classes="section-header" Margin="0,0,0,8"/>
+    <Grid Grid.Row="1" RowDefinitions="Auto,Auto">
+      <DataGrid Name="KeywordGrid" Grid.Row="0" Height="232"
+                AutoGenerateColumns="False"
+                CanUserResizeColumns="False"
+                HeadersVisibility="Column"
+                GridLinesVisibility="Horizontal"
+                Background="{DynamicResource PSTracePanelBg}"
+                Foreground="{DynamicResource PSTraceText}"
+                HorizontalGridLinesBrush="{DynamicResource PSTraceGridLine}"
+                BorderThickness="1" BorderBrush="{DynamicResource PSTraceBorder}">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Keyword" Binding="{Binding Key}" Width="*"/>
+          <DataGridTemplateColumn Header="Colour" Width="160">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate DataType="local:KeywordItem">
+                <ComboBox ItemsSource="{x:Static local:AppConfig.ColorNameList}"
+                          SelectedItem="{Binding Value, Mode=TwoWay}"
+                          Foreground="{DynamicResource PSTraceText}"
+                          Background="{DynamicResource PSTracePanelBg}"
+                          BorderBrush="{DynamicResource PSTraceBorder}"
+                          HorizontalAlignment="Stretch" Margin="2"/>
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+        </DataGrid.Columns>
+      </DataGrid>
+      <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,10,0,0">
+        <Button Name="AddKeywordBtn" Content="Add keyword" Padding="12,4,12,4"/>
+        <Button Name="RemoveKeywordBtn" Content="Remove selected" Padding="12,4,12,4"/>
+      </StackPanel>
     </Grid>
+
+    <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto,116" Margin="0,16,0,0">
+      <TextBlock Grid.Column="0" Text="Font:" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+      <TextBox Grid.Column="1" Name="FontFamilyBox"/>
+      <TextBlock Grid.Column="2" Text="Size:" FontSize="12" VerticalAlignment="Center" Margin="12,0,8,0"/>
+      <NumericUpDown Grid.Column="3" Name="FontSizeBox" Minimum="6" Maximum="72" Increment="1" FormatString="0"/>
+    </Grid>
+
+    <StackPanel Grid.Row="3" Margin="0,16,0,0" Spacing="6">
+      <DockPanel Margin="0,0,0,4">
+        <TextBlock Text="Text color:" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <ComboBox Name="TextColorBox" Width="180" HorizontalAlignment="Left" DockPanel.Dock="Left"
+                  Foreground="{DynamicResource PSTraceText}"
+                  Background="{DynamicResource PSTracePanelBg}"
+                  BorderBrush="{DynamicResource PSTraceBorder}"/>
+        <!-- Live preview of the picked colour on the log surface,
+             so the choice is visible before it is applied. -->
+        <Border Background="#FF18222E" BorderBrush="{DynamicResource PSTraceBorder}" BorderThickness="1"
+                CornerRadius="4" Margin="12,0,0,0" Padding="10,5,10,5" VerticalAlignment="Center">
+          <TextBlock Name="TextColorPreviewText" Text="19:53:37  Info  Sample log line"
+                     FontFamily="Consolas" FontSize="12" VerticalAlignment="Center"/>
+        </Border>
+      </DockPanel>
+      <TextBlock Text="Detail panel formatting" Classes="section-header"/>
+      <WrapPanel>
+        <CheckBox Name="FormatJsonBox" Content="Format JSON" Margin="0,0,16,0"/>
+        <CheckBox Name="SplitCommaBox" Content="Split on comma" Margin="0,0,16,0"/>
+        <CheckBox Name="SplitSpaceBox" Content="Split on space" Margin="0,0,16,0"/>
+        <CheckBox Name="SplitPeriodBox" Content="Split on period"/>
+      </WrapPanel>
+      <DockPanel Margin="0,4,0,0">
+        <TextBlock Text="Custom delimiters (separate with ;):" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBox Name="CustomDelimitersBox"/>
+      </DockPanel>
+      <DockPanel Margin="0,8,0,0">
+        <TextBlock Text="Update speed:" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Name="UpdateSpeedLabel" Text="3" VerticalAlignment="Center" Margin="8,0,0,0" Width="16"/>
+        <Slider Name="UpdateSpeedSlider" Minimum="1" Maximum="5" TickFrequency="1" IsSnapToTickEnabled="True" Value="3"/>
+      </DockPanel>
+      <DockPanel Margin="0,8,0,0">
+        <TextBlock Text="UI scale:" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Name="UiScaleLabel" Text="100%" VerticalAlignment="Center" Margin="8,0,0,0" Width="40"/>
+        <Slider Name="UiScaleSlider" Minimum="75" Maximum="150" TickFrequency="5" IsSnapToTickEnabled="True" Value="100"/>
+      </DockPanel>
+    </StackPanel>
+
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,16,0,0">
+      <Button Name="OkBtn" Content="OK" Classes="accent" Width="90" Padding="0,6,0,6" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+      <Button Name="CancelBtn" Content="Cancel" Width="90" Padding="0,6,0,6" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+    </StackPanel>
+  </Grid>
+  </LayoutTransformControl>
 </Window>
-"@
-    $sWindow = New-XamlWindow -XamlText $settingsXaml -Context "Settings window"
-    if ($null -eq $sWindow) { return }
+'@
+ $settingsCs=@'
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+using Avalonia.Media;
 
-    try {
-        $sWindow.Owner  = $script:MainWindow
-        $FontCombo      = Get-RequiredNamedControl $sWindow "FontCombo"      "Settings window"
-        $SizeCombo      = Get-RequiredNamedControl $sWindow "SizeCombo"      "Settings window"
-        $SpeedCombo     = Get-RequiredNamedControl $sWindow "SpeedCombo"     "Settings window"
-        $JsonCheck      = Get-RequiredNamedControl $sWindow "JsonCheck"      "Settings window"
-        $CommaCheck     = Get-RequiredNamedControl $sWindow "CommaCheck"     "Settings window"
-        $SpaceCheck     = Get-RequiredNamedControl $sWindow "SpaceCheck"     "Settings window"
-        $PeriodCheck    = Get-RequiredNamedControl $sWindow "PeriodCheck"    "Settings window"
-        $NewDelim       = Get-RequiredNamedControl $sWindow "NewDelim"       "Settings window"
-        $AddDelimBtn    = Get-RequiredNamedControl $sWindow "AddDelimBtn"    "Settings window"
-        $RemoveDelimBtn = Get-RequiredNamedControl $sWindow "RemoveDelimBtn" "Settings window"
-        $DelimList      = Get-RequiredNamedControl $sWindow "DelimList"      "Settings window"
-        $KeywordsGrid   = Get-RequiredNamedControl $sWindow "KeywordsGrid"   "Settings window"
-        $RemoveBtn      = Get-RequiredNamedControl $sWindow "RemoveBtn"      "Settings window"
-        $SaveBtn        = Get-RequiredNamedControl $sWindow "SaveBtn"        "Settings window"
-        $CancelBtn      = Get-RequiredNamedControl $sWindow "CancelBtn"      "Settings window"
-    } catch {
-        Report-Error "SettingsMenu" "Control resolution failed: $_"
-        return
+namespace __APPNAME__
+{
+    // A snapshot of the dialog's visual settings, raised through
+    // SettingsWindow.PreviewChanged as the user adjusts them, so
+    // the main window shows the effect immediately (Brandon,
+    // Nov 22) instead of only after OK.
+    public class SettingsPreview
+    {
+        public string FontFamily { get; set; } = "Consolas";
+        public double FontSize { get; set; } = 12;
+        public string TextColorHex { get; set; } = "#FFCCD0D6";
+        public double UiScale { get; set; } = 1.0;
     }
 
-    Add-SlowScroll $KeywordsGrid
-    Add-SlowScroll $DelimList
+    public partial class SettingsWindow : Window
+    {
+        // The dialog's size at 100% scale. The window is resized in
+        // proportion to the UI scale so scaled content is never
+        // compressed into overlap or pushed off the bottom.
+        private const double BaseWidth = 680;
+        private const double BaseHeight = 720;
 
-    $monoKeywords = @("Mono", "Consol", "Courier", "Fixed", "Code", "Cascadia", "Lucida")
-    $allFonts     = [System.Windows.Media.Fonts]::SystemFontFamilies |
-                        Select-Object -ExpandProperty Source | Sort-Object
+        public event Action<SettingsPreview>? PreviewChanged;
+        private readonly AppConfig _config;
+        private readonly ObservableCollection<KeywordItem> _keywords = new ObservableCollection<KeywordItem>();
 
-    foreach ($f in $allFonts) {
-        $isMonoLike = $false
-        foreach ($kw in $monoKeywords) {
-            if ($f -like "*$kw*") { $isMonoLike = $true; break }
-        }
-        if ($isMonoLike) { [void]$FontCombo.Items.Add($f) }
-    }
-    foreach ($f in $allFonts) {
-        if (-not $FontCombo.Items.Contains($f)) { [void]$FontCombo.Items.Add($f) }
-    }
-    if (-not $FontCombo.Items.Contains($script:Config.FontFamily)) {
-        $FontCombo.Items.Insert(0, $script:Config.FontFamily)
-    }
-    $FontCombo.SelectedItem = $script:Config.FontFamily
+        private DataGrid _keywordGrid = null!;
+        private TextBox _fontFamilyBox = null!;
+        private NumericUpDown _fontSizeBox = null!;
+        private CheckBox _formatJsonBox = null!;
+        private CheckBox _splitCommaBox = null!;
+        private CheckBox _splitSpaceBox = null!;
+        private CheckBox _splitPeriodBox = null!;
+        private TextBox _customDelimitersBox = null!;
+        private Slider _updateSpeedSlider = null!;
+        private TextBlock _updateSpeedLabel = null!;
+        private Slider _uiScaleSlider = null!;
+        private TextBlock _uiScaleLabel = null!;
+        private ComboBox _textColorBox = null!;
+        private TextBlock _previewText = null!;
+        private LayoutTransformControl _settingsScale = null!;
 
-    8..24 | ForEach-Object { [void]$SizeCombo.Items.Add($_) }
-    if (-not $SizeCombo.Items.Contains($script:Config.FontSize)) {
-        $SizeCombo.Items.Insert(0, $script:Config.FontSize)
-    }
-    $SizeCombo.SelectedItem = $script:Config.FontSize
+        // Bound from the keyword colour ComboBox in the DataGrid template.
+        public string[] ColorNames => AppConfig.DarkColorMap.Keys.ToArray();
 
-    1..10 | ForEach-Object { [void]$SpeedCombo.Items.Add($_) }
-    if (-not $SpeedCombo.Items.Contains($script:Config.UpdateSpeed)) {
-        $SpeedCombo.Items.Insert(0, $script:Config.UpdateSpeed)
-    }
-    $SpeedCombo.SelectedItem = $script:Config.UpdateSpeed
+        public bool Accepted { get; private set; }
 
-    $JsonCheck.IsChecked   = $script:Config.FormatJson
-    $CommaCheck.IsChecked  = $script:Config.SplitComma
-    $SpaceCheck.IsChecked  = $script:Config.SplitSpace
-    $PeriodCheck.IsChecked = $script:Config.SplitPeriod
-
-    foreach ($d in $script:Config.CustomDelimiters) { [void]$DelimList.Items.Add($d) }
-
-    $kwList = New-Object System.Collections.ObjectModel.ObservableCollection[KeywordItem]
-    foreach ($kv in $script:Config.Keywords.GetEnumerator()) {
-        $kwList.Add((New-Object KeywordItem -Property @{ Key = $kv.Key; Value = $kv.Value }))
-    }
-    $KeywordsGrid.ItemsSource = $kwList
-
-    $AddDelimBtn.Add_Click({
-        if (-not [string]::IsNullOrEmpty($NewDelim.Text)) {
-            [void]$DelimList.Items.Add($NewDelim.Text)
-            $NewDelim.Text = ""
-        }
-    })
-
-    $RemoveDelimBtn.Add_Click({
-        if ($null -ne $DelimList.SelectedItem) {
-            $DelimList.Items.Remove($DelimList.SelectedItem)
-        }
-    })
-
-    $RemoveBtn.Add_Click({
-        if ($null -ne $KeywordsGrid.SelectedItem -and $KeywordsGrid.SelectedItem -is [KeywordItem]) {
-            $kwList.Remove($KeywordsGrid.SelectedItem)
-        }
-    })
-
-    $SaveBtn.Add_Click({
-        $KeywordsGrid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true)
-
-        $duplicates = $kwList |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_.Key) } |
-            Group-Object Key |
-            Where-Object { $_.Count -gt 1 }
-        if ($duplicates) {
-            $dupNames = ($duplicates | Select-Object -ExpandProperty Name) -join ', '
-            [System.Windows.MessageBox]::Show(
-                "The following keywords are duplicated: $dupNames`r`n`r`nPlease remove the duplicates before saving.",
-                "Duplicate Keywords",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Warning) | Out-Null
-            return
+        // Parameterless constructor for the XAML loader; real use goes
+        // through the AppConfig constructor below.
+        public SettingsWindow() : this(AppConfig.Load())
+        {
         }
 
-        $validKeywords = @($kwList | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Key) })
-        if ($validKeywords.Count -gt $script:MaxKeywordCount) {
-            [System.Windows.MessageBox]::Show(
-                "You have defined $($validKeywords.Count) keywords. The maximum allowed is $($script:MaxKeywordCount).`r`nPlease remove some keywords before saving.",
-                "Too Many Keywords",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Warning) | Out-Null
-            return
-        }
+        public SettingsWindow(AppConfig config)
+        {
+            _config = config;
+            InitializeComponent();
 
-        $invalidColors = @($validKeywords | Where-Object { -not (Test-ColorMapKey $_.Value) })
-        if ($invalidColors.Count -gt 0) {
-            $badNames = ($invalidColors | ForEach-Object { "'$($_.Key)' = '$($_.Value)'" }) -join ', '
-            [System.Windows.MessageBox]::Show(
-                "The following keywords have invalid colours: $badNames`r`n`r`nValid colours are: $($script:ColorMap.Keys -join ', ')`r`nPlease correct them before saving.",
-                "Invalid Colours",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Warning) | Out-Null
-            return
-        }
+            _keywordGrid = this.FindControl<DataGrid>("KeywordGrid")!;
+            _fontFamilyBox = this.FindControl<TextBox>("FontFamilyBox")!;
+            _fontSizeBox = this.FindControl<NumericUpDown>("FontSizeBox")!;
+            _formatJsonBox = this.FindControl<CheckBox>("FormatJsonBox")!;
+            _splitCommaBox = this.FindControl<CheckBox>("SplitCommaBox")!;
+            _splitSpaceBox = this.FindControl<CheckBox>("SplitSpaceBox")!;
+            _splitPeriodBox = this.FindControl<CheckBox>("SplitPeriodBox")!;
+            _customDelimitersBox = this.FindControl<TextBox>("CustomDelimitersBox")!;
+            _updateSpeedSlider = this.FindControl<Slider>("UpdateSpeedSlider")!;
+            _updateSpeedLabel = this.FindControl<TextBlock>("UpdateSpeedLabel")!;
+            _uiScaleSlider = this.FindControl<Slider>("UiScaleSlider")!;
+            _uiScaleLabel = this.FindControl<TextBlock>("UiScaleLabel")!;
+            _textColorBox = this.FindControl<ComboBox>("TextColorBox")!;
+            _textColorBox.ItemsSource = AppConfig.TextColorPresets.Keys.ToArray();
+            _textColorBox.SelectedItem = config.TextColorName;
+            _previewText = this.FindControl<TextBlock>("TextColorPreviewText")!;
+            _settingsScale = this.FindControl<LayoutTransformControl>("SettingsScale")!;
 
-        $blankKeyRows = @($kwList | Where-Object { [string]::IsNullOrWhiteSpace($_.Key) })
-        if ($blankKeyRows.Count -gt 0) {
-            $result = [System.Windows.MessageBox]::Show(
-                "$($blankKeyRows.Count) keyword row(s) have an empty key and will be discarded.`r`nContinue saving?",
-                "Empty Keywords",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Warning)
-            if ($result -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        }
+            // The dialog itself renders at the configured UI scale,
+            // and the window is sized in proportion to it.
+            ApplyDialogScale(config.UiScale);
+            UpdateTextColorPreview();
 
-        $defaults = Get-DefaultConfig
-
-        $script:Config.FontFamily = if ($null -ne $FontCombo.SelectedItem) {
-            $FontCombo.SelectedItem
-        } else { $defaults.FontFamily }
-
-        $script:Config.FontSize = if ($null -ne $SizeCombo.SelectedItem) {
-            [Math]::Max($script:MinFontSize, [Math]::Min($script:MaxFontSize, [int]$SizeCombo.SelectedItem))
-        } else { $defaults.FontSize }
-
-        $script:Config.UpdateSpeed = if ($null -ne $SpeedCombo.SelectedItem) {
-            [Math]::Max($script:MinUpdateSpeed, [Math]::Min($script:MaxUpdateSpeed, [int]$SpeedCombo.SelectedItem))
-        } else { $defaults.UpdateSpeed }
-
-        $script:Config.FormatJson  = ($JsonCheck.IsChecked  -eq $true)
-        $script:Config.SplitComma  = ($CommaCheck.IsChecked -eq $true)
-        $script:Config.SplitSpace  = ($SpaceCheck.IsChecked -eq $true)
-        $script:Config.SplitPeriod = ($PeriodCheck.IsChecked -eq $true)
-
-        $delims = New-Object System.Collections.Generic.List[string]
-        foreach ($d in $DelimList.Items) { $delims.Add($d) }
-        $script:Config.CustomDelimiters = $delims
-
-        $newKw = @{}
-        foreach ($item in $kwList) {
-            if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace($item.Key)) {
-                $newKw[$item.Key] = $item.Value
+            foreach (var kv in config.Keywords)
+            {
+                _keywords.Add(new KeywordItem { Key = kv.Key, Value = AppConfig.NormalizeColorName(kv.Value) });
             }
-        }
-        $script:Config.Keywords = $newKw
+            _keywordGrid.ItemsSource = _keywords;
 
-        Clear-BrushCache
-        $script:State.StatsRowCache.Clear()
+            _fontFamilyBox.Text = config.FontFamily;
+            _fontSizeBox.Value = (decimal)config.FontSize;
+            _formatJsonBox.IsChecked = config.FormatJson;
+            _splitCommaBox.IsChecked = config.SplitComma;
+            _splitSpaceBox.IsChecked = config.SplitSpace;
+            _splitPeriodBox.IsChecked = config.SplitPeriod;
+            _customDelimitersBox.Text = string.Join(";", config.CustomDelimiters);
+            _updateSpeedSlider.Value = config.UpdateSpeed;
+            _updateSpeedLabel.Text = config.UpdateSpeed.ToString();
+            _uiScaleSlider.Value = Math.Round(config.UiScale * 100);
+            _uiScaleLabel.Text = $"{(int)Math.Round(_uiScaleSlider.Value)}%";
 
-        Export-Config
-        Set-GuiFromConfig
-
-        $orderedKeywords = Get-SortedKeywords
-        [LogParser]::ReEvaluateAll($script:State.MasterList, $orderedKeywords)
-        Invoke-RebuildFilterBar
-        [void](Invoke-TrimMasterList)
-        Invoke-ApplyFilter
-
-        if ($null -ne $script:State.CurrentLogFile -and -not $PauseBtn.IsChecked) {
-            Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $false
-        }
-
-        try {
-            $isStillFlushing = $false
-            if ($null -ne $script:State.SharedState) {
-                [System.Threading.Monitor]::Enter($script:State.SharedState.SyncRoot)
-                try { $isStillFlushing = $script:State.SharedState.IsFlushingInitialQueue }
-                finally { [System.Threading.Monitor]::Exit($script:State.SharedState.SyncRoot) }
-            }
-            if (-not $isStillFlushing) {
-                Set-TimerInterval ([TimeSpan]::FromSeconds($script:Config.UpdateSpeed))
-            }
-        } catch {
-            Report-Error "Settings.SaveBtn" "Timer reconfigure error: $_"
-        }
-
-        $sWindow.Close()
-    })
-
-    $CancelBtn.Add_Click({ $sWindow.Close() })
-    [void]$sWindow.ShowDialog()
-})
-
-#endregion
-
-#region --- Dispatcher Timer ---
-
-$script:RefreshTimer          = New-Object System.Windows.Threading.DispatcherTimer
-$script:RefreshTimer.Interval = [TimeSpan]::FromMilliseconds($script:FastTimerIntervalMs)
-
-$script:RefreshTimer.Add_Tick({
-    try {
-        $appState    = $script:State
-        $sharedState = $appState.SharedState
-
-        if ($null -ne $sharedState) {
-            $lastError = $null
-            [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-            try {
-                $lastError = $sharedState.LastError
-                if ($null -ne $lastError) { $sharedState.LastError = $null }
-            } finally {
-                [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
-            }
-            if ($null -ne $lastError) {
-                Report-Error "BackgroundThread" $lastError
-            }
-        }
-
-        if ($null -ne $sharedState) {
-            $initialLoadComplete    = $false
-            $isFlushingInitialQueue = $false
-
-            [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-            try {
-                $initialLoadComplete    = $sharedState.InitialLoadComplete
-                $isFlushingInitialQueue = $sharedState.IsFlushingInitialQueue
-            } finally {
-                [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
-            }
-
-            if ($initialLoadComplete -and $isFlushingInitialQueue) {
-                $queueEmpty = ($null -eq $appState.LogQueue -or $appState.LogQueue.IsEmpty)
-                if ($queueEmpty) {
-                    [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-                    try {
-                        if ($sharedState.IsFlushingInitialQueue) {
-                            $sharedState.IsFlushingInitialQueue = $false
-                        }
-                    } finally {
-                        [System.Threading.Monitor]::Exit($sharedState.SyncRoot)
-                    }
-                    Set-TimerInterval ([TimeSpan]::FromSeconds([int]$script:Config.UpdateSpeed))
-                    if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
-                    if ($ScrollBtn.IsChecked -and $null -ne $script:LogScrollViewer) {
-                        $script:LogScrollViewer.ScrollToEnd()
-                    }
-                    Update-StatusBar -Force
+            _updateSpeedSlider.PropertyChanged += (_, e) =>
+            {
+                if (e.Property == Slider.ValueProperty)
+                {
+                    _updateSpeedLabel.Text = ((int)Math.Round(_updateSpeedSlider.Value)).ToString();
                 }
+            };
+            _uiScaleSlider.PropertyChanged += (_, e) =>
+            {
+                if (e.Property == Slider.ValueProperty)
+                {
+                    _uiScaleLabel.Text = $"{(int)Math.Round(_uiScaleSlider.Value)}%";
+                    ApplyDialogScale(Math.Clamp(_uiScaleSlider.Value / 100.0, 0.75, 1.5));
+                    RaisePreview();
+                }
+            };
+            _textColorBox.SelectionChanged += (_, _) =>
+            {
+                UpdateTextColorPreview();
+                RaisePreview();
+            };
+            _fontSizeBox.PropertyChanged += (_, e) =>
+            {
+                if (e.Property == NumericUpDown.ValueProperty) RaisePreview();
+            };
+            _fontFamilyBox.PropertyChanged += (_, e) =>
+            {
+                if (e.Property == TextBox.TextProperty) RaisePreview();
+            };
+
+            this.FindControl<Button>("AddKeywordBtn")!.Click += OnAddKeyword;
+            this.FindControl<Button>("RemoveKeywordBtn")!.Click += OnRemoveKeyword;
+            this.FindControl<Button>("OkBtn")!.Click += OnOk;
+            this.FindControl<Button>("CancelBtn")!.Click += (_, _) => Close();
+        }
+
+        private void ApplyDialogScale(double scale)
+        {
+            _settingsScale.LayoutTransform = new ScaleTransform(scale, scale);
+            Width = BaseWidth * scale;
+            Height = BaseHeight * scale;
+        }
+
+        private void UpdateTextColorPreview()
+        {
+            _previewText.Foreground = new SolidColorBrush(Color.Parse(CurrentTextColorHex()));
+        }
+
+        private string CurrentTextColorHex()
+        {
+            return _textColorBox.SelectedItem is string name &&
+                   AppConfig.TextColorPresets.TryGetValue(name, out var hex)
+                ? hex
+                : _config.TextColorHex();
+        }
+
+        private void RaisePreview()
+        {
+            if (PreviewChanged == null) return;
+            PreviewChanged.Invoke(new SettingsPreview
+            {
+                FontFamily = string.IsNullOrWhiteSpace(_fontFamilyBox.Text) ? _config.FontFamily : _fontFamilyBox.Text.Trim(),
+                FontSize = _fontSizeBox.Value.HasValue ? (double)_fontSizeBox.Value.Value : _config.FontSize,
+                TextColorHex = CurrentTextColorHex(),
+                UiScale = Math.Clamp(_uiScaleSlider.Value / 100.0, 0.75, 1.5),
+            });
+        }
+
+        private void OnAddKeyword(object? sender, RoutedEventArgs e)
+        {
+            _keywords.Add(new KeywordItem { Key = "NewKeyword", Value = "Yellow" });
+        }
+
+        private void OnRemoveKeyword(object? sender, RoutedEventArgs e)
+        {
+            if (_keywordGrid.SelectedItem is KeywordItem item)
+            {
+                _keywords.Remove(item);
             }
         }
 
-        $logQueue = $appState.LogQueue
-        if ($null -ne $logQueue -and -not $logQueue.IsEmpty) {
-            $queueCount = $logQueue.Count
-            $allocSize  = [Math]::Min($queueCount + 1, $script:MaxDrainPerTick)
-            $newEntries = New-Object System.Collections.Generic.List[LogEntry]($allocSize)
-            $rawEntry   = $null
-            $count      = 0
+        private void OnOk(object? sender, RoutedEventArgs e)
+        {
+            var rebuilt = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in _keywords)
+            {
+                string key = (item.Key ?? "").Trim();
+                if (key.Length == 0) continue;
+                string color = AppConfig.DarkColorMap.ContainsKey(item.Value ?? "") ? item.Value! : "White";
+                rebuilt[key] = color;
+            }
+            _config.Keywords = rebuilt;
 
-            while ($logQueue.TryDequeue([ref]$rawEntry) -and $count -lt $script:MaxDrainPerTick) {
-                $typedEntry = $rawEntry -as [LogEntry]
-                if ($null -ne $typedEntry) {
-                    [void]$newEntries.Add($typedEntry)
-                } else {
-                    Report-Error "RefreshTimer.Tick" "Queue contained non-LogEntry type '$($rawEntry.GetType().FullName)'; discarded."
-                }
-                $count++
+            if (!string.IsNullOrWhiteSpace(_fontFamilyBox.Text)) _config.FontFamily = _fontFamilyBox.Text.Trim();
+            if (_fontSizeBox.Value.HasValue) _config.FontSize = (double)_fontSizeBox.Value.Value;
+            _config.FormatJson = _formatJsonBox.IsChecked == true;
+            _config.SplitComma = _splitCommaBox.IsChecked == true;
+            _config.SplitSpace = _splitSpaceBox.IsChecked == true;
+            _config.SplitPeriod = _splitPeriodBox.IsChecked == true;
+            _config.CustomDelimiters = new List<string>(
+                (_customDelimitersBox.Text ?? "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+            _config.UpdateSpeed = Math.Clamp((int)Math.Round(_updateSpeedSlider.Value), 1, 5);
+            _config.UiScale = Math.Clamp(_uiScaleSlider.Value / 100.0, 0.75, 1.5);
+            if (_textColorBox.SelectedItem is string colorName &&
+                AppConfig.TextColorPresets.ContainsKey(colorName))
+            {
+                _config.TextColorName = colorName;
             }
 
-            if ($newEntries.Count -gt 0) {
-                $appState.MasterList.AddRange($newEntries)
-                $trimmed = Invoke-TrimMasterList
-                if (-not $trimmed) {
-                    Add-VisibleEntries -Entries $newEntries
-                }
-
-                if ($ScrollBtn.IsChecked) {
-                    $shouldScroll = $true
-                    if ($null -ne $sharedState) {
-                        $stillFlushing = $false
-                        [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-                        try { $stillFlushing = $sharedState.IsFlushingInitialQueue }
-                        finally { [System.Threading.Monitor]::Exit($sharedState.SyncRoot) }
-                        if ($stillFlushing -and -not $logQueue.IsEmpty) {
-                            $shouldScroll = $false
-                        }
-                    }
-                    if ($shouldScroll) {
-                        if ($null -eq $script:LogScrollViewer) { $script:LogScrollViewer = Find-ScrollViewer $LogDataGrid }
-                        if ($null -ne $script:LogScrollViewer) {
-                            $script:LogScrollViewer.ScrollToEnd()
-                        }
-                    }
-                }
-            }
+            Accepted = true;
+            Close();
         }
-
-        if ($null -ne $sharedState) {
-            $stillFlushing2 = $false
-            [System.Threading.Monitor]::Enter($sharedState.SyncRoot)
-            try { $stillFlushing2 = $sharedState.IsFlushingInitialQueue }
-            finally { [System.Threading.Monitor]::Exit($sharedState.SyncRoot) }
-            if ($stillFlushing2) { 
-                if ($null -ne $TotalCountText) { 
-                    $total = if ($null -ne $appState.MasterList) { $appState.MasterList.Count } else { 0 }
-                    $TotalCountText.Text = $total.ToString("N0") 
-                }
-            }
-        }
-
-    } catch {
-        Report-Error "RefreshTimer.Tick" "$_"
     }
-})
-
-#endregion
-
-#region --- Auto-Open Last File ---
-
-if (-not [string]::IsNullOrWhiteSpace($script:Config.LastLogFile) -and (Test-Path $script:Config.LastLogFile)) {
-    $script:State.CurrentLogFile       = $script:Config.LastLogFile
-    $script:MainWindow.Title           = "Configuration Manager Trace Log Tool - $($script:Config.LastLogFile)"
-    $OpenLogOverlay.Visibility         = [System.Windows.Visibility]::Collapsed
-    Invoke-RebuildFilterBar
-    Start-LogTailing -FilePath $script:State.CurrentLogFile -ResetState $true
 }
+'@
+ $errorAxaml=@'
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="__APPNAME__.ErrorLogWindow"
+        Title="PSTrace Error Log"
+        Width="720" Height="420" MinWidth="420" MinHeight="240"
+        FontFamily="Segoe UI, Inter, DejaVu Sans, sans-serif"
+        RequestedThemeVariant="Dark"
+        Background="{DynamicResource PSTraceSurfaceBg}"
+        Foreground="{DynamicResource PSTraceText}"
+        WindowStartupLocation="CenterOwner">
+  <Grid RowDefinitions="*,Auto" Margin="16">
+    <ListBox Name="ErrorList" Grid.Row="0" FontFamily="Consolas" FontSize="12"
+             Background="{DynamicResource PSTracePanelBg}"
+             Foreground="{DynamicResource PSTraceText}"
+             BorderThickness="1" BorderBrush="{DynamicResource PSTraceBorder}"/>
+    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button Name="CloseBtn" Content="Close" Width="90" Padding="0,6,0,6" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+ $errorCs=@'
+using Avalonia.Controls;
+using Avalonia.Threading;
 
-#endregion
+namespace __APPNAME__
+{
+    public partial class ErrorLogWindow : Window
+    {
+        private readonly ListBox _errorList;
 
-#region --- Start ---
+        public ErrorLogWindow()
+        {
+            InitializeComponent();
+            _errorList = this.FindControl<ListBox>("ErrorList")!;
+            _errorList.ItemsSource = ErrorLog.Snapshot();
+            this.FindControl<Button>("CloseBtn")!.Click += (_, _) => Close();
+            ErrorLog.Changed += OnErrorLogChanged;
+            Closed += (_, _) => ErrorLog.Changed -= OnErrorLogChanged;
+        }
 
-Update-StatusBar -Force
-$script:RefreshTimer.Start()
-
-try {
-    [void]$script:MainWindow.ShowDialog()
-} catch {
-    Show-FatalError -Title "Main window runtime error" -Context "ShowDialog failed." -Exception $_.Exception
+        private void OnErrorLogChanged()
+        {
+            Dispatcher.UIThread.Post(() => _errorList.ItemsSource = ErrorLog.Snapshot());
+        }
+    }
 }
+'@
+ $remotePathCs=@'
+using System;
 
-#endregion
+namespace __APPNAME__
+{
+    // Builds the UNC path for a log file on a remote Windows computer
+    // from the two fields of the Open Remote dialog. This is plain SMB
+    // file access: no agent on the remote machine, no new protocol. The
+    // resulting path goes through the same OpenLogFile and
+    // FileShare.ReadWrite tailer path as a local file, so tailing,
+    // filters, and statistics behave identically; only the reachability
+    // failures differ, and the tailer reports those.
+    public static class RemoteLogPath
+    {
+        // computer: a NetBIOS name or DNS name, e.g. DC1. Surrounding
+        // backslashes are tolerated and stripped.
+        // path: the path on that computer, starting with a share name,
+        // e.g. C$\Windows\Logs\file.log (admin share) or
+        // Logs\share\file.log. A full UNC path (\\computer\share\...)
+        // is passed through unchanged, so pasting one works.
+        // Returns null when there is not enough to build a path from.
+        public static string? Build(string? computer, string? path)
+        {
+            string p = (path ?? "").Trim();
+            string c = (computer ?? "").Trim().Trim('\\');
+            if (p.Length == 0) return null;
+            if (IsUnc(p)) return p;
+            if (c.Length == 0) return null;
+            return "\\\\" + c + "\\" + p.TrimStart('\\');
+        }
+
+        public static bool IsUnc(string? path) =>
+            !string.IsNullOrEmpty(path) &&
+            path.StartsWith("\\\\", StringComparison.Ordinal);
+    }
+}
+'@
+ $remoteAxaml=@'
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="__APPNAME__.RemoteOpenWindow"
+        Title="Open Remote Log"
+        Width="520" Height="270" MinWidth="420" MinHeight="240"
+        FontFamily="Segoe UI, Inter, DejaVu Sans, sans-serif"
+        RequestedThemeVariant="Dark"
+        Background="{DynamicResource PSTraceSurfaceBg}"
+        Foreground="{DynamicResource PSTraceText}"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False">
+  <Grid RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" Margin="16">
+    <Grid Grid.Row="0" ColumnDefinitions="120,*" Margin="0,0,0,10">
+      <TextBlock Grid.Column="0" Text="Computer name:" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center"/>
+      <TextBox Grid.Column="1" Name="ComputerBox" Watermark="e.g. DC1"/>
+    </Grid>
+    <Grid Grid.Row="1" ColumnDefinitions="120,*" Margin="0,0,0,10">
+      <TextBlock Grid.Column="0" Text="Path:" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center"/>
+      <TextBox Grid.Column="1" Name="PathBox" Watermark="e.g. C$\Logs\file.log or share\folder\file.log"/>
+    </Grid>
+    <TextBlock Grid.Row="2" TextWrapping="Wrap" FontSize="12" Foreground="{DynamicResource PSTraceMutedText}"
+               Text="Opens the file over SMB as \\computer\path. Admin shares such as C$ work when your account has rights on that computer. A full UNC path pasted into the Path field is used as-is."/>
+    <TextBlock Grid.Row="3" Name="PreviewText" Margin="0,10,0,0" FontFamily="Consolas" Foreground="{DynamicResource PSTraceAccentText}"/>
+    <TextBlock Grid.Row="4" Name="HintText" Margin="0,6,0,0" Foreground="{DynamicResource PSTraceErrorText}" TextWrapping="Wrap"/>
+    <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,12,0,0">
+      <Button Name="OpenBtn" Content="Open" Classes="accent" Width="90" Padding="0,6,0,6" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+      <Button Name="CancelBtn" Content="Cancel" Width="90" Padding="0,6,0,6" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+ $remoteCs=@'
+using Avalonia.Controls;
+using Avalonia.Input;
+
+namespace __APPNAME__
+{
+    // File, Open Remote dialog. Returns the composed UNC path as the
+    // dialog result (ShowDialog<string?>), or null when cancelled. All
+    // path composition lives in RemoteLogPath so it can be unit tested
+    // without a window.
+    public partial class RemoteOpenWindow : Window
+    {
+        private TextBox _computerBox = null!;
+        private TextBox _pathBox = null!;
+        private TextBlock _previewText = null!;
+        private TextBlock _hintText = null!;
+
+        public RemoteOpenWindow()
+        {
+            InitializeComponent();
+
+            _computerBox = this.FindControl<TextBox>("ComputerBox")!;
+            _pathBox = this.FindControl<TextBox>("PathBox")!;
+            _previewText = this.FindControl<TextBlock>("PreviewText")!;
+            _hintText = this.FindControl<TextBlock>("HintText")!;
+
+            _computerBox.TextChanged += (_, _) => UpdatePreview();
+            _pathBox.TextChanged += (_, _) => UpdatePreview();
+
+            this.FindControl<Button>("OpenBtn")!.Click += (_, _) => TryOpen();
+            this.FindControl<Button>("CancelBtn")!.Click += (_, _) => Close(null);
+
+            KeyDown += (_, e) =>
+            {
+                if (e.Key == Key.Enter) { TryOpen(); e.Handled = true; }
+                else if (e.Key == Key.Escape) { Close(null); e.Handled = true; }
+            };
+
+            Opened += (_, _) => _computerBox.Focus();
+        }
+
+        private void UpdatePreview()
+        {
+            string? unc = RemoteLogPath.Build(_computerBox.Text, _pathBox.Text);
+            _previewText.Text = unc == null ? "" : $"Will open: {unc}";
+        }
+
+        private void TryOpen()
+        {
+            string? unc = RemoteLogPath.Build(_computerBox.Text, _pathBox.Text);
+            if (unc == null)
+            {
+                _hintText.Text = "Enter a computer name and a path, or paste a full UNC path into the Path field.";
+                return;
+            }
+            Close(unc);
+        }
+    }
+}
+'@
+Set-Content -LiteralPath (Join-Path $Dir ($Name+'.csproj')) -Value $projCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'Program.cs') -Value $progCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'App.axaml') -Value $appAxaml.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'App.axaml.cs') -Value $appCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'LogParser.cs') -Value $parserCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'LogTailer.cs') -Value $tailerCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'AppConfig.cs') -Value $configCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'MainWindow.axaml') -Value $mwAxaml.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'MainWindow.axaml.cs') -Value $mwCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'SettingsWindow.axaml') -Value $settingsAxaml.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'SettingsWindow.axaml.cs') -Value $settingsCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'ErrorLogWindow.axaml') -Value $errorAxaml.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'ErrorLogWindow.axaml.cs') -Value $errorCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'RemoteLogPath.cs') -Value $remotePathCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'RemoteOpenWindow.axaml') -Value $remoteAxaml.Replace('__APPNAME__',$Name) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $Dir 'RemoteOpenWindow.axaml.cs') -Value $remoteCs.Replace('__APPNAME__',$Name) -Encoding UTF8
+}
+function New-Project([string]$ExePath,[string]$Name,[string]$Dir){
+Invoke-DotNet -ExePath $ExePath -FailCode 4 -CliArgs @('new','console','-n',$Name,'-o',$Dir)
+if(-not (Test-Path -LiteralPath (Join-Path $Dir ($Name+'.csproj')))){Throw-Code 4 'The template reported success but the project workspace could not be created.'}}
+function Publish-Project([string]$ExePath,[string]$Dir,[string]$Out){
+Write-Info 'Running Windows-targeted package restore...'
+Invoke-DotNet -ExePath $ExePath -FailCode 4 -CliArgs @('restore',$Dir,'-r','win-x64','--interactive','false')
+Write-Info 'Compiling and publishing self-contained binary...'
+Invoke-DotNet -ExePath $ExePath -FailCode 5 -CliArgs @('publish',$Dir,'-c','Release','-r','win-x64','--self-contained','true','-o',$Out,'/p:UseSharedCompilation=false','/p:NodeReuse=false')}
+function Start-PublishedApp([string]$Exe,[string]$WorkDir,[string[]]$AppArgs=@()){
+try{
+if($AppArgs -and $AppArgs.Count -gt 0){
+ $quoted=@($AppArgs | ForEach-Object {'"'+($_ -replace '"','\"')+'"'})
+Start-Process -FilePath $Exe -WorkingDirectory $WorkDir -ArgumentList ($quoted -join ' ')
+}else{
+Start-Process -FilePath $Exe -WorkingDirectory $WorkDir
+}
+return $true}catch{Write-Warn2 "Auto-launch failed: $($_.Exception.Message)";Write-Warn2 'The executable is valid and complete - start manually by double-clicking:';Write-Warn2 "    $Exe";return $false}}
+ $sw=[Diagnostics.Stopwatch]::StartNew()
+try{
+ $ProjectName=Get-SafeName $ProjectName
+if([string]::IsNullOrWhiteSpace($BaseDir)){if($PSScriptRoot){$BaseDir=$PSScriptRoot}else{$BaseDir=(Get-Location).Path}}
+if($BaseDir.EndsWith('\') -and $BaseDir.Length -gt 3){$BaseDir=$BaseDir.TrimEnd('\')}
+if([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)){Throw-Code 1 'The LOCALAPPDATA environment variable is not set.'}
+ $ProjectDir=Join-Path $BaseDir $ProjectName
+ $PublishDir=Join-Path $ProjectDir 'publish'
+ $AppArgs=@()
+if(-not [string]::IsNullOrWhiteSpace($FilePath)){$AppArgs+=$FilePath}
+if($FileArgs){foreach($a in $FileArgs){if(-not [string]::IsNullOrWhiteSpace($a)){$AppArgs+=$a}}}
+Write-Host ''
+Write-Host '================================================================' -ForegroundColor Cyan
+Write-Host "  Bootstrap: building '$ProjectName' (Avalonia CMTrace log viewer)" -ForegroundColor Cyan
+Write-Host '================================================================' -ForegroundColor Cyan
+Initialize-Tls
+ $Script:StageName='Environment checks'
+Write-Stage '1/8' 'Initializing TLS and checking free disk space'
+Write-Info "Running on Windows PowerShell $($PSVersionTable.PSVersion); TLS 1.2+ enforced; target framework net8.0."
+Test-DiskSpace -Path $BaseDir
+ $Script:StageName='Clean slate'
+Write-Stage '2/8' "Preparing clean workspace: $ProjectDir"
+if(Test-Path -LiteralPath $ProjectDir){Write-Info 'Existing project folder found; destroying it...';if(-not (Remove-Folder -Path $ProjectDir)){Write-Err2 "Could not delete '$ProjectDir' after repeated attempts.";exit 7}Write-Ok 'Old project folder removed and verified gone.'}
+try{[void][IO.Directory]::CreateDirectory($BaseDir)}catch{Throw-Code 7 "Could not create base directory '$BaseDir': $($_.Exception.Message)"}
+try{[void][IO.Directory]::CreateDirectory($ProjectDir)}catch{Throw-Code 7 "Could not create project directory '$ProjectDir': $($_.Exception.Message)"}
+if(-not (Test-Path -LiteralPath $ProjectDir)){Throw-Code 7 "Project directory '$ProjectDir' could not be created."}
+Write-Ok 'Fresh project directory is ready.'
+ $Script:StageName='.NET SDK detection/install'
+Write-Stage '3/8' 'Detecting or installing .NET 8 SDK (user-local, zero elevation)'
+ $DotNetExe=Find-DotNetSdk
+if($DotNetExe){$sdkSource='pre-existing .NET 8 SDK';Write-Ok "Using verified 8.x SDK: $DotNetExe"}
+else{
+Write-Info "No functional .NET 8 SDK detected; installing a user-local copy under: $($Script:DotnetDir)"
+Install-DotNetSdk
+Set-DotNetEnv -Dir $Script:DotnetDir
+ $DotNetExe=Join-Path $Script:DotnetDir 'dotnet.exe'
+if(-not (Test-SdkWorks -DotNetPath $DotNetExe)){
+Write-Warn2 'SDK verification failed. Wiping directory and reinstalling once...'
+if(-not (Remove-Folder -Path $Script:DotnetDir)){Throw-Code 3 "Could not delete SDK directory '$($Script:DotnetDir)'."}
+Install-DotNetSdk
+Set-DotNetEnv -Dir $Script:DotnetDir
+if(-not (Test-SdkWorks -DotNetPath $DotNetExe)){Throw-Code 3 'The .NET 8 SDK was installed but still fails basic verification.'}
+}
+ $sdkSource='freshly installed user-local SDK'
+}
+Set-DotNetEnv -Dir (Split-Path $DotNetExe)
+ $v=(& $DotNetExe --version);if($LASTEXITCODE -ne 0){Throw-Code 3 "dotnet --version failed with exit code $LASTEXITCODE."}
+Write-Ok "Verified .NET SDK version: $v ($sdkSource)"
+ $Script:StageName='Project creation'
+Write-Stage '4/8' 'Initializing project workspace structure'
+New-Project -ExePath $DotNetExe -Name $ProjectName -Dir $ProjectDir
+Write-Ok 'Workspace initialized.'
+ $Script:StageName='Writing sources'
+Write-Stage '5/8' 'Writing PSTrace Avalonia source files'
+Write-SourceFiles -Dir $ProjectDir -Name $ProjectName
+Write-Ok 'All PSTrace source files written.'
+ $Script:StageName='Restore/build/publish'
+Write-Stage '6/8' 'Restoring Win32 Avalonia packages and publishing self-contained executable'
+Publish-Project -ExePath $DotNetExe -Dir $ProjectDir -Out $PublishDir
+Write-Ok 'Publish completed.'
+ $Script:StageName='Artifact verification'
+Write-Stage '7/8' 'Verifying published artifact executable'
+ $exe=Join-Path $PublishDir ($ProjectName+'.exe')
+if(-not (Test-Path -LiteralPath $exe)){Start-Sleep -Seconds 3}
+if(-not (Test-Path -LiteralPath $exe)){Throw-Code 5 "Publish reported success but '$exe' was not found. Your antivirus may have quarantined it - add an exception and re-run."}
+ $size=(Get-Item -LiteralPath $exe).Length
+if($size -lt 1MB){Throw-Code 5 "Published exe is only $size bytes (too small for a self-contained executable)."}
+ $sizeMb=[math]::Round($size/1MB,1)
+Write-Ok "Executable verified: $exe ($sizeMb MB)"
+ $Script:StageName='Launch'
+if($NoLaunch){Write-Stage '8/8' 'Auto-launch skipped (-NoLaunch provided)';Write-Info "Run the app by double-clicking: $exe"}
+else{Write-Stage '8/8' 'Launching the freshly built Avalonia application';if($AppArgs.Count -gt 0){Write-Info "Opening log file argument(s): $($AppArgs -join ', ')"};if(-not (Start-PublishedApp -Exe $exe -WorkDir $PublishDir -AppArgs $AppArgs)){exit 6}}
+Write-Host ''
+Write-Host '================================================================' -ForegroundColor Green
+Write-Host '  SUCCESS - application built, verified, and ready' -ForegroundColor Green
+Write-Host '================================================================' -ForegroundColor Green
+Write-Ok "Project workspace : $ProjectDir"
+Write-Ok "Publish directory : $PublishDir"
+Write-Ok "Self-contained EXE: $exe ($sizeMb MB)"
+Write-Ok "SDK source        : $sdkSource"
+Write-Ok ("Build time        : {0:hh\:mm\:ss}" -f $sw.Elapsed)
+exit 0
+}
+catch{
+ $code=1;if($_.Exception.Message -match '^\[(\d)\]'){$code=[int]$Matches[1]}
+Write-Host ''
+Write-Err2 "FAILED during stage: $($Script:StageName)"
+Write-Err2 "Error: $($_.Exception.Message)"
+Write-Err2 'Next step: address the error above and re-run.'
+exit $code
+}
+finally{
+if($Script:InstallerPath -and (Test-Path -LiteralPath $Script:InstallerPath)){Remove-Item -LiteralPath $Script:InstallerPath -Force -ErrorAction SilentlyContinue}
+}
